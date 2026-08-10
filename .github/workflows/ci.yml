@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# herdr-loop's go.mod carries `replace github.com/cyperx84/herdr-api => ../herdr-api`
+# because herdr-api isn't published yet. Every job below checks out both repos as
+# siblings and runs with herdr-loop as the working directory, so that replace
+# directive resolves exactly the way it does on a contributor's machine.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out herdr-loop
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: herdr-loop
+
+      - name: Check out herdr-api (sibling, for the go.mod replace directive)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cyperx84/herdr-api
+          path: herdr-api
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: herdr-loop/go.mod
+
+      - name: gofmt
+        working-directory: herdr-loop
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt needs to be run on:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: go vet
+        working-directory: herdr-loop
+        run: go vet ./...
+
+      - name: go test
+        working-directory: herdr-loop
+        run: go test ./...
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - name: Check out herdr-loop
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: herdr-loop
+
+      - name: Check out herdr-api (sibling, for the go.mod replace directive)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cyperx84/herdr-api
+          path: herdr-api
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: herdr-loop/go.mod
+
+      - name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+        working-directory: herdr-loop
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build ./...

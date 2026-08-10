@@ -1,0 +1,86 @@
+# Converge-until-clean: impl and review retrigger each other until review is
+# satisfied, then a mechanical gate (a test run) has the final word.
+#
+# This manifest contains a real rule cycle: impl -> review -> impl. Try
+# deleting `max_iterations` below and re-parsing — internal/manifest's cycle
+# detector (Tarjan's algorithm over the slot data-flow graph) rejects the
+# file at parse time with "rule cycle through slot(s) impl -> review has no
+# retry cap". That check is real today — see the "rule cycle with no cap"
+# case in internal/manifest/manifest_test.go's TestParseErrors, and
+# TestCycleAcceptedCases for what a cap or a per-rule timeout allows through.
+# A loop that can retry forever is a config error caught before it starts,
+# not a runtime surprise.
+#
+# Validates today: `herdr-loop validate examples/converge-until-clean.toml`
+# exits 0. There is no `herdr-loop run` or
+# `validate` CLI yet — see the README's Status section for exactly what does
+# and doesn't exist yet.
+
+[loop]
+name           = "converge-until-clean"
+# Required here: it's what makes the impl<->review cycle below acceptable to
+# the validator. Each full round (impl -> review -> impl) consumes one
+# iteration off this budget; 8 is generous for a real review loop, tune down
+# once you've seen how many rounds your reviewer actually needs.
+max_iterations = 8
+handoff_dir    = ".herdr-loop/handoff"
+
+# --- slots -------------------------------------------------------------
+
+[[slot]]
+name     = "impl"
+kind     = "claude"
+worktree = { branch = "loop/impl", base = "main" }
+
+[[slot]]
+name     = "review"
+kind     = "codex"
+worktree = { branch = "loop/review", base = "main" }
+
+[[slot]]
+name = "verify"
+kind = "opencode"
+# A slot may set cwd instead of worktree when it's read-only or otherwise
+# doesn't need its own checkout — worktree isolation exists to stop two
+# *writers* from colliding, not to isolate every participant unconditionally.
+# (herdr-loop does not enforce that verify is actually read-only; that's on
+# the prompt you give it.)
+cwd = "/repo"
+
+# --- rules ---------------------------------------------------------------
+
+[[rule]]
+when = { op = "all", filters = [
+  { op = "eq", field = "slot",   value = "impl" },
+  { op = "in", field = "status", values = ["idle", "done"] },
+] }
+then = { prompt = { slot = "review", text = "Review {{impl.handoff}}. Findings only." } }
+
+# The retrigger edge that makes this a cycle: review's verdict sends work
+# back to impl.
+[[rule]]
+when = { op = "eq", field = "review.handoff.verdict", value = "changes-requested" }
+then = { prompt = { slot = "impl", text = "Address {{review.handoff}}" } }
+
+# Escape hatch: an arbitrary command, branching on exit code. review saying
+# "clean" isn't the finish line by itself — a mechanical gate gets the final
+# word before the loop calls itself done. on_success/on_failure are
+# themselves actions (only `run` may nest them: a prompt/finish has no exit
+# code to branch on).
+[[rule]]
+when = { op = "eq", field = "review.handoff.verdict", value = "clean" }
+then = { finish = "converged" }
+
+# The mechanical gate this loop wants at the end — a test run with the final
+# word — is NOT expressible yet. `run` actions are designed (see PLAN.md §3:
+# an escape hatch that shells out and branches on exit code) but the engine
+# does not execute them, so `herdr-loop validate` rejects any manifest using
+# one rather than letting the rule silently never fire.
+#
+# When run actions land, the rule above becomes:
+#
+#   [[rule]]
+#   when = { op = "eq", field = "review.verdict", value = "clean" }
+#   then = { run = ["cargo", "test"],
+#            on_success = { finish = "green" },
+#            on_failure = { prompt = { slot = "impl", text = "Tests fail:\n{{stdout}}" } } }

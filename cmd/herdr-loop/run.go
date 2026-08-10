@@ -1,0 +1,379 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	herdr "github.com/cyperx84/herdr-api"
+	"github.com/cyperx84/herdr-loop/internal/engine"
+	"github.com/cyperx84/herdr-loop/internal/manifest"
+	"github.com/cyperx84/herdr-loop/internal/state"
+)
+
+// cmdRun is the supervisor entry point: the pane herdr-plugin.toml's
+// [[panes]] board keeps alive for the lifetime of one loop (PLAN §2 — herdr
+// owns this process's lifecycle, it dies with the server, and it is visible
+// and steerable, which is the whole reason it runs as a pane rather than a
+// detached [[startup]] daemon).
+func cmdRun(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	// Defaults come from HERDR_LOOP_* env vars — herdr-plugin.toml's
+	// [[actions]]/[[panes]] entries invoke `run` with no arguments, since
+	// herdr's plugin docs document no {{config.x}} command-template
+	// placeholder to fill one in with (checked, not assumed: see
+	// herdr-plugin.toml's comment on the run action). [config] values reach
+	// this process as HERDR_LOOP_<KEY> env vars instead, the same convention
+	// herdr-sesh-bro's shipped, working manifest uses for its own prefix.
+	// Flags still override the env, so `herdr-loop run` works standalone
+	// from a plain shell too.
+	kindsPath := fs.String("kinds", envOr("HERDR_LOOP_KINDS_FILE", "kinds.toml"), "kinds.toml path (optional — absent file is not an error)")
+	reconcileSecs := fs.Int("reconcile-interval", envOrInt("HERDR_LOOP_RECONCILE_INTERVAL_SECS", int(state.DefaultReconcileInterval/time.Second)), "seconds between authoritative agent.list reconciles")
+	logLevel := fs.String("log-level", envOr("HERDR_LOOP_LOG_LEVEL", "info"), "debug|info|warn|error")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	var manifestPath string
+	switch fs.NArg() {
+	case 0:
+		manifestPath = envOr("HERDR_LOOP_DEFAULT_MANIFEST", "loop.toml")
+	case 1:
+		manifestPath = fs.Arg(0)
+	default:
+		return errors.New("usage: herdr-loop run [flags] [manifest.toml]")
+	}
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLogLevel(*logLevel)}))
+
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+	m, err := manifest.Parse(data)
+	if err != nil {
+		return fmt.Errorf("run: %s: %w", manifestPath, err)
+	}
+	res, err := mapManifest(m)
+	if err != nil {
+		return fmt.Errorf("run: %s: %w", manifestPath, err)
+	}
+
+	client, err := herdr.Open()
+	if err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+	// Pinned protocol check (PLAN §4.13): refuse to run against a server this
+	// client was not built for, with a clear message, rather than sending it
+	// requests it may not understand.
+	if err := client.CheckProtocol(ctx); err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+
+	if err := resolveWorktrees(ctx, client, &res); err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+
+	kinds, err := loadKinds(*kindsPath)
+	if err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+	res.Config.Kinds = kinds
+	if err := checkKindCapacity(res.Config.Slots, kinds); err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+
+	rs := runState{
+		LoopName:     res.Config.Name,
+		ManifestPath: manifestPath,
+		PID:          os.Getpid(),
+		StartedAt:    time.Now().UTC(),
+	}
+	if err := writeRunState(rs); err != nil {
+		// Not fatal to the loop itself — only to status/stop's ability to
+		// find it. Warn loudly rather than silently degrading to
+		// unsupervisable.
+		log.Warn("could not persist run state; status/stop will not see this loop", "err", err)
+	}
+	defer func() {
+		if err := clearRunState(); err != nil {
+			log.Warn("could not clear run state", "err", err)
+		}
+	}()
+
+	reconcileEvery := time.Duration(*reconcileSecs) * time.Second
+	if reconcileEvery <= 0 {
+		reconcileEvery = state.DefaultReconcileInterval
+	}
+
+	idx := newNameIndex()
+	sm := state.New(teeingSnapshotter{client: client, idx: idx}, state.Options{ReconcileEvery: reconcileEvery})
+
+	bus, err := newEventBus(ctx, client)
+	if err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+	defer bus.Close()
+
+	if err := goLive(ctx, sm, bus); err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+	log.Info("state model live", "reconciles", sm.Stats().Reconciles)
+
+	eng, err := engine.New(res.Config, client, modelAdapter{state: sm, idx: idx}, log)
+	if err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+
+	spawnAll(ctx, eng, res.Config.Slots, log)
+
+	transitions := make(chan engine.Transition, 64)
+	go feed(ctx, sm, bus, idx, eng, client, reconcileEvery, res.InitialPrompts, transitions, log)
+
+	outcome, err := eng.Run(ctx, transitions)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("run: %w", err)
+	}
+	log.Info("loop finished", "reason", outcome.Reason, "rule", outcome.Rule,
+		"iterations", outcome.Iterations, "escalations", len(outcome.Escalations))
+	for _, esc := range outcome.Escalations {
+		log.Warn("escalation", "detail", esc.String())
+	}
+	return nil
+}
+
+// goLive drains the replayed event prefix and reconciles until state.Model
+// reports live (PLAN §4.8). Nothing downstream is actionable before this —
+// state.Model.Apply itself reports no transitions while !live — so run must
+// not start spawning or feeding the engine until it returns.
+//
+// Reconcile's own doc says a non-empty session needs at least two passes
+// (one to adopt the snapshot, one to confirm nothing moved since), which is
+// why this loops rather than reconciling once and trusting it.
+func goLive(ctx context.Context, sm *state.Model, bus *eventBus) error {
+	for {
+		// Drain whatever the bus has already buffered, without blocking,
+		// before reconciling — comparing against a snapshot while known
+		// events sit unapplied would manufacture a divergence that was
+		// never really there (Reconcile's own doc, PLAN §4.8).
+	drain:
+		for {
+			select {
+			case ev, ok := <-bus.Events():
+				if !ok {
+					return errors.New("event stream closed before the model went live")
+				}
+				if ev.Kind == "pane_created" || ev.Kind == "pane_agent_detected" {
+					if p := paneIDOf(ev); p != "" {
+						bus.watch(ctx, p)
+					}
+				}
+				sm.Apply(ev) // replayed prefix: no transition is actionable yet
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				break drain
+			}
+		}
+
+		rec, err := sm.Reconcile(ctx)
+		if err != nil {
+			return fmt.Errorf("initial reconcile: %w", err)
+		}
+		if rec.WentLive {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+}
+
+// spawnAll brings every configured slot up in parallel. engine.Spawn queues
+// each call against its own kind's concurrency gate (§4.7) internally, so
+// this does not need its own throttle — the fan-out here just lets
+// independent kinds start concurrently instead of waiting on each other.
+func spawnAll(ctx context.Context, eng *engine.Engine, slots []engine.SlotConfig, log *slog.Logger) {
+	var wg sync.WaitGroup
+	for _, s := range slots {
+		wg.Add(1)
+		go func(slot string) {
+			defer wg.Done()
+			if err := eng.Spawn(ctx, slot); err != nil {
+				log.Error("spawn failed", "slot", slot, "err", err)
+			}
+		}(s.Name)
+	}
+	wg.Wait()
+}
+
+// resolveWorktrees materializes a checkout for every slot the manifest gave
+// a worktree instead of a bare cwd, filling in the SlotConfig fields
+// engine.Spawn needs before engine.New ever sees them.
+//
+// This is the one part of "load this manifest" that genuinely requires a
+// live connection, which is why it is isolated here rather than folded into
+// mapManifest: validate and doctor call mapManifest against a manifest with
+// worktree slots and never reach this function, so they still work with no
+// herdr connection at all (PLAN §4.2 requires one worktree per slot; this is
+// where that requirement is actually satisfied for a live run).
+func resolveWorktrees(ctx context.Context, client *herdr.Client, res *mapResult) error {
+	for _, req := range res.Worktrees {
+		branch := req.Branch
+		params := herdr.WorktreeCreateParams{Branch: &branch}
+		if req.Base != "" {
+			base := req.Base
+			params.Base = &base
+		}
+		created, err := client.WorktreeCreate(ctx, params)
+		if err != nil {
+			return fmt.Errorf("worktree.create for slot %q (branch %s): %w",
+				res.Config.Slots[req.SlotIndex].Name, branch, err)
+		}
+		res.Config.Slots[req.SlotIndex].CWD = created.Worktree.Path
+		res.Config.Slots[req.SlotIndex].WorkspaceID = created.Workspace.ID
+		// created.RootPane is the new workspace's own first pane, but
+		// engine.Spawn always opens a second pane via pane.split rather than
+		// accepting a caller-supplied one (see engine.go's Spawn) — so this
+		// root pane is left idle. Known imperfection, not a silent drop:
+		// letting Spawn reuse it belongs to the engine package, which this
+		// CLI does not own.
+	}
+	return nil
+}
+
+// feed is the supervisor's single event-loop goroutine. state.Model requires
+// Apply and Reconcile to be driven from one goroutine (its own package doc),
+// so this is the only place either is called once run is past goLive.
+func feed(
+	ctx context.Context,
+	sm *state.Model,
+	bus *eventBus,
+	idx *nameIndex,
+	eng *engine.Engine,
+	client *herdr.Client,
+	reconcileEvery time.Duration,
+	initialPrompts map[string]string,
+	out chan<- engine.Transition,
+	log *slog.Logger,
+) {
+	defer close(out)
+	ticker := time.NewTicker(reconcileEvery)
+	defer ticker.Stop()
+
+	handle := func(tr state.Transition) {
+		if tr.Gone {
+			bus.unwatch(tr.PaneID)
+		}
+		slot, known := idx.slotFor(tr.PaneID)
+		if known && tr.Gone {
+			// Return the kind's concurrency token. Spawn deliberately holds it
+			// for the agent's lifetime, so without this every kind leaks a
+			// permanent token and a second slot of the same kind blocks in
+			// acquireKind until its context expires — with the default cap of
+			// one, that hangs spawnAll's WaitGroup and the run never starts.
+			// This is the exact point the model has established the agent left.
+			eng.Release(slot)
+		}
+		if !known {
+			// A pane this loop does not own — reconciliation is session-
+			// wide, so seeing one is expected traffic, not an error.
+			return
+		}
+		if tr.BecameSettled() {
+			if text, pending := initialPrompts[slot]; pending {
+				// Bootstrap, not a rule action: delivering a slot's initial
+				// prompt happens exactly once, the same way Spawn does (see
+				// mapResult.InitialPrompts' doc). This transition is
+				// consumed here, not forwarded — the engine's rules are for
+				// handoff between already-running slots, and treating "just
+				// spawned, about to receive its kickoff prompt" as a
+				// settled-and-idle slot would let a handoff rule fire on it
+				// before it has done any work.
+				//
+				// Bypassing the rule engine does NOT license bypassing the
+				// per-slot lock: this prompt reaches the same agent's input
+				// widget as any rule-driven one, and AgentPrompt is a blocking
+				// round-trip. Without the lock a reconcile-sourced transition
+				// could fire a rule for this slot mid-delivery and race two
+				// prompts into one agent — exactly what the lock exists to
+				// stop. If the slot is busy, leave the prompt pending; the
+				// next settled transition brings us back.
+				lk, free := eng.TryLockSlot(slot)
+				if !free {
+					log.Debug("initial prompt deferred: slot busy", "slot", slot)
+					return
+				}
+				delete(initialPrompts, slot)
+				go func() {
+					defer lk.Unlock()
+					deliverInitialPrompt(ctx, client, tr.PaneID, slot, text, log)
+				}()
+				return
+			}
+		}
+		select {
+		case out <- engine.Transition{Slot: slot, From: tr.From, To: tr.To, At: tr.At}:
+		case <-ctx.Done():
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-bus.Events():
+			if !ok {
+				return
+			}
+			if ev.Kind == "pane_created" || ev.Kind == "pane_agent_detected" {
+				if p := paneIDOf(ev); p != "" {
+					bus.watch(ctx, p)
+				}
+			}
+			if tr, ok := sm.Apply(ev); ok {
+				handle(tr)
+			}
+		case <-ticker.C:
+			rec, err := sm.Reconcile(ctx)
+			if err != nil {
+				log.Warn("reconcile failed", "err", err)
+				continue
+			}
+			for _, tr := range rec.Transitions {
+				handle(tr)
+			}
+		}
+	}
+}
+
+// deliverInitialPrompt sends a slot's [[slot]].prompt exactly once, the
+// first time that slot settles after being spawned. See feed's handle
+// closure for why this bypasses the rule engine entirely.
+func deliverInitialPrompt(ctx context.Context, client *herdr.Client, target, slot, text string, log *slog.Logger) {
+	if _, err := client.AgentPrompt(ctx, target, text, nil); err != nil {
+		log.Error("initial prompt failed", "slot", slot, "err", err)
+		return
+	}
+	log.Info("initial prompt delivered", "slot", slot)
+}
+
+func parseLogLevel(s string) slog.Level {
+	switch strings.ToLower(s) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}

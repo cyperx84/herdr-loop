@@ -375,7 +375,65 @@ with far more history suggests a ring buffer) and whether the server offers any
 caught-up marker. Neither is documented; the snapshot-agreement approach above does not
 depend on the answer.
 
-### 4.9 Protocol pinning
+### 4.9 Trust no inferred state — corroborate before acting
+
+**The single most cross-cutting finding in the ecosystem sweep** (full evidence:
+`docs/demand-research.md`). Across nine unrelated repos and teams, the same failure
+recurs: an agent, slot, or process is reported fine — `idle`, `working`, `started` — while
+actually stalled, blocked, or dead, and nobody finds out until they go looking.
+
+herdr #509 (workflow shows idle while sub-agents still work), #2618/#2591 (OpenCode stuck
+blocked), discussions #1635 and #1346 (Pi and OpenCode blocked state reported as
+working/idle), vibe-kanban #3227 (session stuck "running" after socket close),
+herdr-orchestrator #34 (stalls silently at timeout), agentbox #302 (start reports success
+when the bind failed), collie #54/#34 and herdr-remote #17 (input silently lost).
+
+Nine independent codebases converging means this is **structural to inferring agent state
+from CLI output**, not a bug in any one implementation. §4.6 already establishes that
+`claude` and `codex` states are screen-classified heuristics — this is what that costs in
+practice.
+
+**Design principle, stated rather than left implicit:** every inferred state is
+*unverified* until corroborated. Before acting on a transition that triggers irreversible
+work, the engine corroborates: the process is actually alive (`pane.process_info`), and
+the predicate that would explain the state actually holds. A heuristic `idle` alone is
+never sufficient grounds to tear down, merge, or commit.
+
+### 4.10 Teardown never destroys uncommitted work
+
+Backed by a real documented data-loss incident in the closest prior art:
+`sean1588/herdr-orchestrator` #34, the maintainer's own dogfood report — *"no-PR escalation
+`--force`-removes the worktree, discarding uncommitted work… destroyed a
+completed-but-uncommitted implementation."* Same design shape as ours: worktree per task,
+timeout-based escalation.
+
+§4.3 covers approval *bypass*; this is a distinct invariant it does not cover.
+
+**Requirement:** every escalation, timeout, and teardown path commits or stashes before
+any worktree removal. `--force` removal of a dirty worktree is not reachable from any
+code path. Small guard, non-negotiable for v1 — the failure mode is proven, not
+hypothetical.
+
+### 4.11 Every escalation carries a structured reason
+
+Same source thread: *"the tool tends to stall silently at a timeout instead of saying
+why."* Corroborated by four independent reports of the status-lies class (§4.9).
+
+**Requirement:** escalation events carry which predicate failed, which rule fired, how
+long the slot was stalled, and the last observed state — never a bare timeout. Cheap to
+build in now, expensive once the event schema is frozen. v1.
+
+### 4.12 Reconciliation must be order-independent and idempotent
+
+`persiyanov/herdr-reviewr` #5: two plugins both subscribed to `worktree.created` and
+*"herdr runs the handlers in no guaranteed order."*
+
+herdr's event bus offers no subscriber-ordering guarantee. Combined with the replay
+behaviour in §4.8 and the drop-on-full-buffer policy, the reconciler must be correct under
+arbitrary ordering, duplication, and loss. This is a constraint to design against from day
+one, not a property to discover in production.
+
+### 4.13 Protocol pinning
 
 herdr-loop checks `schema_version` + `protocol` at startup like the client does, and
 refuses to run against an incompatible server with a clear message rather than sending
@@ -433,6 +491,63 @@ Known-declining prior art, so it isn't cited as live: Crystal deprecated 2026-02
 `parruda/claude-swarm` repo gone, Claude Flow's Rust/consensus claims unsupported by its
 implementation. Best-executed scraping-tier detector to learn from: `bosun` (Rust) —
 screen-*region*-targeted detection with debounce rather than full-pane regex.
+
+## 4c. Demand evidence — what users actually asked for
+
+Full mining report with every URL and quote: `docs/demand-research.md`. Method per the
+standing plugin doctrine: mine open *and* closed issues across upstream and the ecosystem
+for unmet demand, then build the findings in.
+
+**Methodology finding worth keeping:** herdrdev/herdr's issue bot triages *all* feature
+requests out of Issues into **Discussions** (863 of them). Anyone mining only
+`gh issue list` on herdr core structurally misses the entire demand signal.
+
+**Validated by evidence — keep as designed:**
+
+- *File-based handoff* (§4.1). herdr discussion #2401 and issue #2306, plus collie #54/#34
+  and herdr-remote #17, all describe the same failure: text typed into a live pane is
+  silently dropped. Our handoff avoids that class by never typing into panes for results.
+  Verify in v1 that no race-prone fallback path exists.
+- *Parse-time loop termination* (§3). Correct, but **not a differentiator** — bermuda,
+  herdr-factory and herdr-orchestrator independently converged on bounded-loop-with-cap.
+  Table stakes. Do not lead with it.
+
+**Reframed for honesty:**
+
+- *Per-kind concurrency caps* (§4.7). Real and well-evidenced — claude-code #29217 has 8+
+  independent reporters and a third-party fix tool — but **zero herdr-ecosystem users have
+  asked for it** (explicitly searched, no hits). Present it as defensive design against a
+  documented unfixed upstream bug, never as a user request. Overclaiming demand is the
+  fastest way to lose trust.
+
+**New requirements adopted from demand (were not planned):**
+
+| # | Requirement | Where | Timing |
+|---|---|---|---|
+| 1 | Structured reason on every escalation | §4.11 | v1 |
+| 2 | Teardown never destroys uncommitted work | §4.10 | v1 |
+| 3 | Order-independent, idempotent reconciliation | §4.12 | v1 |
+| 4 | Per-slot progress + append-only log surfaced to a controller | below | v1 |
+| 5 | Escalation → OS notification hook | below | v1 |
+
+**4 — Per-slot progress and log surface.** herdr discussion #713, two distinct commenters,
+one stating this is *what is holding them back from switching their orchestrator to
+herdr* — the only finding in the sweep where a missing feature blocks herdr adoption
+outright. Four people describe the same shape: watching N parallel workers from one
+control point with no way to tell how far along each is. Requirement: each slot publishes
+structured progress and an append-only log; the supervisor surfaces both live. This is
+what makes herdr-loop watchable mid-run instead of a black box until convergence — and it
+directly serves the "visibility and steering in one surface" goal.
+
+**5 — Escalation notification hook.** claude-code #70591 (multiple commenters: *"as the
+number of concurrent agents increases, terminal switching becomes a significant source of
+friction"*) and herdr discussion #1970, where a third-party plugin already answers a
+blocked agent's prompt from a macOS notification. The plumbing exists; piggyback
+`notification.show` rather than inventing a channel. Without this, §4.3's escalations only
+reach a per-slot log and the original pain recurs inside herdr-loop.
+
+**Not covered by the sweep**, flagged rather than assumed: `sarmientoF/herdr-pr-loop`,
+`SecretAardvark/pi-overseer`, `machine-machine/herdr-factory-loop-skill`.
 
 ## 5. Cross-harness capability table
 

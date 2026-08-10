@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a manifest field, rule capability, or engine behaviour
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [PLAN.md](https://github.com/cyperx84/herdr-loop/blob/main/PLAN.md) first, especially §3 (the loop model is deliberately
+        not a general workflow engine) and §4 (every safety requirement there is
+        non-negotiable, not a starting point for discussion). A proposal that reopens one
+        of those decisions should say so explicitly and argue against the recorded
+        reasoning, not restate the feature.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What loop can't be expressed today?
+      description: A concrete manifest or scenario the current predicate/action set can't cover — not a hypothetical.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: Sketch the loop.toml syntax or engine behaviour, if you have one in mind.
+      render: toml
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: This isn't already covered by the existing predicate ops (all/any/not/eq/in/exists) or the run+on_success/on_failure escape hatch
+          required: true
+        - label: This doesn't require an embedded scripting engine (PLAN.md §3 explicitly defers that until a concrete rule can't be expressed without it — if this is that case, say so)
+          required: true

@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a problem with herdr-loop
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        herdr-loop is pre-alpha — see the README's Status section for what's actually
+        built. If you're reporting that `herdr plugin install` or `herdr-loop run` doesn't
+        work at all, that's expected right now, not a bug; please check Status first.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear description of the incorrect behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: manifest
+    attributes:
+      label: loop.toml (or the relevant fragment)
+      render: toml
+    validations:
+      required: false
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+
+  - type: input
+    id: component
+    attributes:
+      label: Which package
+      description: internal/manifest, internal/state, internal/engine, or "not sure"
+    validations:
+      required: false
+
+  - type: input
+    id: herdr-version
+    attributes:
+      label: herdr version
+      description: Output of `herdr --version`
+    validations:
+      required: false
+
+  - type: input
+    id: commit
+    attributes:
+      label: herdr-loop commit or version
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - macOS
+        - Linux
+        - Windows
+    validations:
+      required: true

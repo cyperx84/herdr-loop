@@ -1,0 +1,61 @@
+# Simple two-slot review loop.
+#
+# One implementer, one reviewer, no retry: impl writes code, review reads it
+# and either says "clean" (loop finishes) or leaves findings in its handoff
+# file for a human to pick up. There is no impl<->review retrigger cycle here,
+# so loop.max_iterations is optional — see converge-until-clean.toml for the
+# case where it's required.
+#
+# Validates today against internal/manifest (`go test ./internal/manifest`
+# exercises this exact shape). There is no `herdr-loop validate` CLI yet to
+# run this file through directly — see the README's Status section.
+
+[loop]
+name        = "two-slot-review"
+handoff_dir = ".herdr-loop/handoff"
+# on_blocked defaults to "escalate": if either agent hits an approval prompt,
+# herdr-loop halts that slot and notifies rather than guessing an answer.
+
+# --- slots -------------------------------------------------------------
+
+[[slot]]
+name     = "impl"
+kind     = "claude"
+# One worktree per slot, always (never a bare `cwd` shared with another
+# slot) — two agents in one working tree produces phantom commits neither
+# of them made.
+worktree = { branch = "loop/impl", base = "main" }
+# {{task}} is filled from a manifest variable supplied at run time (not yet
+# wired up — see README). $HERDR_LOOP_HANDOFF is the env var herdr-loop sets
+# on this slot's pane; the agent must write its result there, never rely on
+# herdr-loop scraping its terminal output for the answer.
+prompt = "Implement {{task}}. Write your result to $HERDR_LOOP_HANDOFF."
+
+[[slot]]
+name     = "review"
+kind     = "codex"
+worktree = { branch = "loop/review", base = "main" }
+
+# --- rules ---------------------------------------------------------------
+
+# When impl settles (idle or done — never mid-turn), hand its result to
+# review. `op = "in"` mirrors herdr's own AgentViewFilter predicate DSL, not
+# a herdr-loop invention.
+[[rule]]
+when = { op = "all", filters = [
+  { op = "eq", field = "slot",   value = "impl" },
+  { op = "in", field = "status", values = ["idle", "done"] },
+] }
+then = { prompt = { slot = "review", text = "Review {{impl.handoff}}. Findings only." } }
+
+# review.handoff.verdict reads a typed field out of review's handoff
+# front-matter (YAML `---` or TOML `+++` at the top of the file review wrote,
+# e.g. `verdict: clean`). If review's prompt never asks it to report a
+# verdict, this rule simply never fires — no error, no accidental finish.
+[[rule]]
+when = { op = "eq", field = "review.handoff.verdict", value = "clean" }
+then = { finish = "converged" }
+
+# No rule sends review's findings back to impl: this loop hands off to a
+# human on anything but "clean". See converge-until-clean.toml for the
+# closed-loop version, which needs max_iterations because it retriggers.
