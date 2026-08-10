@@ -816,3 +816,47 @@ external gates poll on a declared interval.*
 Separately in flight: the terminal multi-agent orchestration state of the art outside
 herdr (claude-squad, uzi, Crystal, Conductor, vibe-kanban, container-use, claude-swarm,
 claude-flow, tmux orchestrators) — for design patterns and known failure modes.
+
+---
+
+## 12. Known gaps — honest status as of 2026-08-11
+
+Both repos are green: `gofmt`, `go vet`, `go test -race`, and cross-compilation to
+windows/amd64, linux/amd64, linux/arm64 and darwin/arm64. ~6,900 lines of Go in
+herdr-loop, ~3,000 in herdr-api. An adversarial review found seven defects; five are
+fixed with regression tests that fail against the old behaviour. What remains:
+
+**Not yet implemented — tracked, not hidden:**
+
+1. **Detection tier never reaches the engine (F3).** `state.Tier` is computed correctly
+   from `screen_detection_skipped` and carried on every transition, then dropped by the
+   engine's `Model` interface. No rule can gate on trust, and `strict` (§4.6) exists only
+   in comments. At runtime a screen-classified heuristic `done` is treated identically to
+   a structured one. `doctor` does report the tier, so this is advisory-but-unenforced
+   rather than invisible. Fix: `SlotTier` on `engine.Model`, a `tier` predicate field,
+   and a `Config.Strict` that refuses irreversible actions on `TierScreen`.
+2. **§4.9 corroboration is not actually implemented.** The requirement is to confirm the
+   process is alive (`pane.process_info`) before acting on an inferred state. The engine's
+   current measure re-reads the model at fire time, which re-reads *the same inference*.
+   Impact is limited today because the engine only prompts and spawns rather than merging
+   or tearing down — but the code comments read as if it were covered, which is worse than
+   a gap. Needs `PaneProcessInfo` on the `Herdr` interface.
+3. **`run` actions are designed but not executed.** `validate` refuses them loudly rather
+   than letting a rule silently never fire, which is the right failure, but the escape
+   hatch promised in §3 is absent.
+4. **The five demand-driven requirements (§4c) are specified, not built**: structured
+   escalation reason, teardown-never-destroys-uncommitted-work (currently vacuous —
+   `WorktreeRemove` has no caller, so nothing can destroy anything yet), per-slot progress
+   and log surface, escalation-to-notification hook.
+5. **No live `pane_agent_status_changed` has been observed end to end.** Decoders are
+   contract-tested against real captured frames, but the wire path for the one signal the
+   engine gates on is still unproven against a running agent. Closing it means spawning an
+   agent — use `opencode`, which is structurally detected (§4.6) and runs keyless, rather
+   than an OAuth-authenticated kind.
+
+**Verified genuinely enforced in code**, not merely described — confirmed by adversarial
+review reading the implementation: escalate-by-default with whole-string prompt matching
+and no implicit enter; settled-state-only prompting; `unknown` excluded from settled;
+one-worktree-per-slot; parse-time cycle detection (a real Tarjan SCC pass) backed by a
+runtime iteration budget; SHA256 verification in the build bootstrap that fails closed and
+could not be bypassed under test.
