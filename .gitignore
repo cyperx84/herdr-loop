@@ -1,0 +1,12 @@
+# binaries
+/bin/
+*.exe
+*.test
+
+# coverage
+*.out
+coverage.*
+
+# local scratch
+/tmp/
+.DS_Store
