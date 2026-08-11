@@ -236,6 +236,37 @@ go test ./...
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the sibling-checkout requirement and what each
 package's tests actually need to cover.
 
+
+## Measuring a harness
+
+Loop orchestration lives or dies on per-harness behaviour: whether an agent
+self-reports its status or gets classified from the screen, how long before it
+can take a prompt, whether it blocks on first run, whether it finishes a turn
+at all. None of that is documented anywhere, and it differs per harness and per
+version.
+
+So measure it rather than believe it:
+
+```sh
+herdr-loop probe pi                     # one harness
+herdr-loop probe claude --args="--model sonnet"
+herdr-loop probe --all                  # every kind installed here
+```
+
+Each probe runs the harness through the same lifecycle the engine does —
+create the pane, wait for its shell, start the agent, wait for it to become
+addressable, prompt it, watch for the turn to finish — and prints both what
+happened and the `kinds.toml` stanza that follows from it. `--all` adds a
+compatibility matrix across every kind installed on the machine.
+
+It costs one real agent invocation per kind, so pin a cheap model with
+`--args` on anything that bills.
+
+This exists because hand-measured capability tables are wrong in ways nobody
+notices. One entry in this repo's own `kinds.toml` claimed opencode needed a
+six-second settle; the probe showed it needs none, and that the stalls behind
+that entry were caused by something else entirely.
+
 ## License
 
 [MIT](LICENSE)

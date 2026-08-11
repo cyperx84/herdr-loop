@@ -28,12 +28,15 @@ max_concurrent    = 1
 # a screen-classification guess. Keyless on free models, so concurrency costs
 # nothing and races no credential.
 max_concurrent = 3
-# opencode reports itself interactive before its TUI can accept input — herdr's
-# readiness is about the process, not about whether a text UI has finished
-# painting. Prompting into that gap goes nowhere and surfaces as
-# agent_prompt_stalled. Measured, not guessed: shorter waits reproduced the
-# stall.
-startup_settle_ms = 6000
+# No settle needed — `herdr-loop probe opencode` takes a prompt immediately and
+# completes a turn in ~34s.
+#
+# An earlier entry here set startup_settle_ms = 6000 on the strength of
+# hand-observed stalls. The probe disproved it: those stalls were the pane
+# being squeezed to a sliver by repeated splitting, not a readiness gap, and
+# they disappeared once slots got their own tab. Recorded because it is the
+# argument for probing rather than remembering — a hand-measured table encodes
+# whatever the measurer happened to have wrong.
 
 # ── Pi ────────────────────────────────────────────────────────────────────────
 [pi]

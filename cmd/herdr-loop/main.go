@@ -71,6 +71,8 @@ func run(args []string) error {
 		return cmdValidate(args[1:])
 	case "doctor":
 		return cmdDoctor(ctx, args[1:])
+	case "probe":
+		return cmdProbe(args[1:])
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
