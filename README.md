@@ -4,11 +4,16 @@
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![herdr-plugin](https://img.shields.io/badge/herdr--plugin-topic-6f42c1)](https://github.com/topics/herdr-plugin)
+[![status: experimental](https://img.shields.io/badge/status-experimental-orange)](#status)
+
+> **Early. I'm playing with an idea.** It works — everything below ran against real
+> agents — but the format will change, one person has used it, and you should not build
+> anything you care about on it yet.
 
 Declarative, event-driven multi-agent loops for [herdr](https://herdr.dev) — a `loop.toml`
 file that turns herdr's single-agent pane primitives into a fleet: implement, review, gate,
-retry, converge, across any mix of `claude`, `codex`, `opencode`, `pi`, and 17 other
-harnesses herdr recognises.
+retry, converge — across `claude`, `codex`, `opencode` and `pi`, the four harnesses
+measured so far out of the 21 herdr recognises.
 
 ```sh
 herdr plugin install cyperx84/herdr-loop
@@ -317,6 +322,17 @@ rather than firing them in parallel.
 **Every escalation carries a structured reason** — which rule fired (or didn't), the slot's
 last observed status, how long it had been stalled, and the approval text if the model could
 see it. Never a bare timeout.
+
+## Status
+
+Experimental. The loop engine and graph layer run end to end, the safety invariants are
+implemented and were adversarially reviewed, four harnesses are measured.
+
+It has one user. Every bug found so far was found by running it, which means the
+interesting ones are still out there. `loop.toml` and `graph.toml` are a first guess at
+the right shape and will change. No stability promise.
+
+Useful right now if you want to argue about the design — open an issue.
 
 ## Limitations, stated plainly
 
