@@ -185,8 +185,14 @@ type KindConfig struct {
 	// BackTab as unsupported keys, while the escape sequence they stand for
 	// goes through unchanged.
 	StartupKeys []string
-	// StartupSettle is how long to wait after StartupKeys before prompting,
-	// letting the UI redraw. Zero means DefaultStartupSettle.
+	// StartupSettle is how long to wait before this kind's first prompt.
+	//
+	// Applies with or without StartupKeys, because some harnesses report
+	// themselves interactive before their TUI can take input — herdr's
+	// readiness is about the process, not about whether a text UI has
+	// finished painting. Prompting into that gap is delivered to nothing and
+	// surfaces as agent_prompt_stalled. Measured per kind; there is no
+	// general answer.
 	StartupSettle time.Duration
 }
 
@@ -403,9 +409,12 @@ type Engine struct {
 
 	slots map[string]SlotConfig
 
-	mu          sync.Mutex
-	iterations  int
-	halted      map[string]bool
+	mu         sync.Mutex
+	iterations int
+	halted     map[string]bool
+	// worked records slots observed leaving StatusWorking — i.e. having
+	// actually finished a turn, as opposed to merely being idle.
+	worked      map[string]bool
 	escalations []Escalation
 	locks       map[string]*sync.Mutex
 	// kindGates are counting semaphores, one per kind, each holding a token
@@ -496,6 +505,7 @@ func New(cfg Config, client Herdr, model Model, log *slog.Logger) (*Engine, erro
 		slots:     slots,
 		halted:    map[string]bool{},
 		locks:     map[string]*sync.Mutex{},
+		worked:    map[string]bool{},
 		finish:    make(chan Outcome, 1),
 		kindGates: map[string]chan struct{}{},
 		held:      map[string]string{},
@@ -683,6 +693,13 @@ func (e *Engine) step(ctx context.Context, tr Transition) (Outcome, bool) {
 		return Outcome{}, false
 	}
 
+	if tr.From == herdr.StatusWorking {
+		// Left working: a turn actually happened. Recorded before any
+		// eligibility check, so it counts even when this particular
+		// transition goes on to be ignored.
+		e.noteTurn(tr.Slot)
+	}
+
 	status, ok := e.model.SlotStatus(tr.Slot)
 	if !ok {
 		e.log.Warn("model has no state for a slot that transitioned", "slot", tr.Slot)
@@ -708,6 +725,23 @@ func (e *Engine) step(ctx context.Context, tr Transition) (Outcome, bool) {
 		e.log.Debug("slot not settled, no rules evaluated", "slot", tr.Slot, "status", status)
 		return Outcome{}, false
 	}
+	// A slot that has never worked has not finished anything.
+	//
+	// Rules read "when impl has finished, hand it to review", but status
+	// alone cannot tell "finished a turn" from "just spawned and waiting":
+	// both are idle. A freshly spawned slot therefore satisfied every rule
+	// keyed on it the instant it appeared — observed with a two-slot loop
+	// where the review slot's gate ran before the implementer had been given
+	// its task, failed on untouched code, and sent that failure back as
+	// feedback about work nobody had done.
+	//
+	// A completed turn is a transition OUT of working. That is the signal,
+	// and it is the one thing spawning cannot fake.
+	if !e.hasWorked(tr.Slot) {
+		e.log.Debug("slot has not completed a turn yet, no rules evaluated",
+			"slot", tr.Slot, "status", status)
+		return Outcome{}, false
+	}
 
 	f := e.newFacts(tr.Slot, status)
 	for _, r := range e.cfg.Rules {
@@ -720,6 +754,26 @@ func (e *Engine) step(ctx context.Context, tr Transition) (Outcome, bool) {
 	}
 	return Outcome{}, false
 }
+
+// noteTurn records that a slot left StatusWorking, which is the only evidence
+// that it did a turn rather than simply existing.
+func (e *Engine) noteTurn(slot string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.worked[slot] = true
+}
+
+// hasWorked reports whether a slot has completed at least one turn.
+func (e *Engine) hasWorked(slot string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.worked[slot]
+}
+
+// MarkWorked records a completed turn from outside the engine — the supervisor
+// uses it for a slot whose first turn was its bootstrap prompt, delivered
+// outside the rule path.
+func (e *Engine) MarkWorked(slot string) { e.noteTurn(slot) }
 
 // triggerEligible reports whether a slot in this status may trigger rule
 // evaluation (§4.4).
@@ -1063,7 +1117,7 @@ const DefaultStartupSettle = 400 * time.Millisecond
 // a cosmetic keystroke would be the wrong trade.
 func (e *Engine) applyStartupKeys(ctx context.Context, slot, paneID string) {
 	kc := e.kindConfig(e.slots[slot].Kind)
-	if len(kc.StartupKeys) == 0 {
+	if len(kc.StartupKeys) == 0 && kc.StartupSettle <= 0 {
 		return
 	}
 	// Wait for the harness to actually be interactive first. agent.start
@@ -1080,7 +1134,7 @@ func (e *Engine) applyStartupKeys(ctx context.Context, slot, paneID string) {
 	for _, seq := range kc.StartupKeys {
 		if err := e.client.PaneSendText(ctx, paneID, decodeEscapes(seq)); err != nil {
 			e.log.Warn("startup key not delivered", "slot", slot, "pane", paneID, "err", err)
-			return
+			break
 		}
 	}
 	settle := kc.StartupSettle

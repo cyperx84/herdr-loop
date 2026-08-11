@@ -348,6 +348,11 @@ func feed(
 					defer lk.Unlock()
 					deliverInitialPrompt(ctx, eng, tr.PaneID, slot, text, log)
 				}()
+				// The kickoff counts as this slot's first turn. Without it a
+				// slot whose only work is its bootstrap prompt could never
+				// satisfy a rule: the engine requires an observed turn, and
+				// this one was delivered outside the rule path.
+				eng.MarkWorked(slot)
 				return
 			}
 		}

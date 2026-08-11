@@ -432,7 +432,7 @@ func TestAutoAnswersOnlyExactMatches(t *testing.T) {
 			cfg.BlockedRules = []BlockedRule{{Prompt: allowed, Keys: []string{"y", "Enter"}}}
 			e := newEngine(t, cfg, client, model)
 
-			run(t, e, Transition{Slot: "impl", To: herdr.StatusBlocked, At: time.Now()})
+			run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusBlocked, At: time.Now()})
 
 			if got := client.keyCount() > 0; got != tc.wantKeys {
 				t.Errorf("answered = %v, want %v (prompt %q)", got, tc.wantKeys, tc.prompt)
@@ -459,7 +459,7 @@ func TestAutoWhitelistHasNoPatternLanguage(t *testing.T) {
 	cfg.BlockedRules = []BlockedRule{{Prompt: "Allow Bash(.*)?", Keys: []string{"y"}}}
 	e := newEngine(t, cfg, client, model)
 
-	run(t, e, Transition{Slot: "impl", To: herdr.StatusBlocked, At: time.Now()})
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusBlocked, At: time.Now()})
 
 	if n := client.keyCount(); n != 0 {
 		t.Fatalf("a regexp-looking blocked_rule matched a different prompt %d times; the whitelist must be literal", n)
@@ -482,8 +482,8 @@ func TestBlockedPauseEndsTheLoop(t *testing.T) {
 	// The second transition would satisfy the impl->review rule. It must never
 	// be reached: pause ends the loop at the first block.
 	out := run(t, e,
-		Transition{Slot: "impl", To: herdr.StatusBlocked, At: time.Now()},
-		Transition{Slot: "impl", To: herdr.StatusDone, At: time.Now()},
+		Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusBlocked, At: time.Now()},
+		Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone, At: time.Now()},
 	)
 
 	if out.Reason != ReasonPaused {
@@ -548,7 +548,7 @@ func TestMidTurnInjectionIsAPerKindCapability(t *testing.T) {
 	cfg.Kinds = map[string]KindConfig{"codex": {MidTurnInjection: true}}
 	e := newEngine(t, cfg, client, model)
 
-	run(t, e, Transition{Slot: "impl", To: herdr.StatusDone})
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone})
 
 	if n := client.promptCount(); n != 1 {
 		t.Fatalf("prompts = %d, want 1 once the kind's mid-turn capability is enabled", n)
@@ -577,7 +577,7 @@ func TestIterationBudgetTerminatesTheLoop(t *testing.T) {
 
 	client := &fakeHerdr{}
 	e := newEngine(t, cfg, client, model)
-	out := run(t, e, Transition{Slot: "impl", To: herdr.StatusDone})
+	out := run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone})
 
 	if out.Reason != ReasonBudgetExhausted {
 		t.Fatalf("Reason = %q, want %q", out.Reason, ReasonBudgetExhausted)
@@ -604,7 +604,7 @@ func TestIterationBudgetBoundsActionsUnderABurst(t *testing.T) {
 
 	trs := make([]Transition, 50)
 	for i := range trs {
-		trs[i] = Transition{Slot: "impl", To: herdr.StatusDone}
+		trs[i] = Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone}
 	}
 	out := run(t, e, trs...)
 
@@ -646,9 +646,9 @@ func TestPerSlotMutexAllowsOneActionInFlight(t *testing.T) {
 		done <- out
 	}()
 
-	ch <- Transition{Slot: "impl", To: herdr.StatusDone}
+	ch <- Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone}
 	<-entered // first spawn is in flight and parked inside PaneSplit
-	ch <- Transition{Slot: "impl", To: herdr.StatusDone}
+	ch <- Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone}
 	close(ch)
 
 	// Give the second transition a chance to be mishandled before releasing.
@@ -808,7 +808,7 @@ func TestRulesReadTypedFieldsFromTheHandoffFile(t *testing.T) {
 			e := newEngine(t, cfg, client, model)
 
 			writeFile(t, e.HandoffPath("review"), tc.contents)
-			out := run(t, e, Transition{Slot: "review", To: herdr.StatusDone})
+			out := run(t, e, Transition{Slot: "review", From: herdr.StatusWorking, To: herdr.StatusDone})
 
 			fired := out.Reason == "converged"
 			if fired != tc.want {
@@ -829,7 +829,7 @@ func TestMissingHandoffMakesPredicatesNotHold(t *testing.T) {
 	}}
 	e := newEngine(t, cfg, &fakeHerdr{}, newModel().set("review", herdr.StatusDone))
 
-	out := run(t, e, Transition{Slot: "review", To: herdr.StatusDone})
+	out := run(t, e, Transition{Slot: "review", From: herdr.StatusWorking, To: herdr.StatusDone})
 	if out.Reason != ReasonStreamClosed {
 		t.Fatalf("Reason = %q, want the loop to keep folding with no handoff file", out.Reason)
 	}
@@ -846,7 +846,7 @@ func TestPromptTemplateExpansion(t *testing.T) {
 		model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
 		e := newEngine(t, cfg, client, model)
 
-		run(t, e, Transition{Slot: "impl", To: herdr.StatusDone})
+		run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone})
 
 		client.mu.Lock()
 		defer client.mu.Unlock()
@@ -869,7 +869,7 @@ func TestPromptTemplateExpansion(t *testing.T) {
 		model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
 		e := newEngine(t, cfg, client, model)
 
-		out := run(t, e, Transition{Slot: "impl", To: herdr.StatusDone})
+		out := run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone})
 
 		if n := client.promptCount(); n != 0 {
 			t.Fatalf("prompts = %d, want 0 — a literal {{nope}} must never reach an agent", n)
@@ -888,7 +888,7 @@ func TestFailedActionEscalatesWithTheCause(t *testing.T) {
 	model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
 	e := newEngine(t, baseConfig(t), client, model)
 
-	out := run(t, e, Transition{Slot: "impl", To: herdr.StatusDone})
+	out := run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone})
 
 	if len(out.Escalations) != 1 {
 		t.Fatalf("Escalations = %d, want 1", len(out.Escalations))
@@ -909,14 +909,14 @@ func TestHaltedSlotIsIgnoredAfterwards(t *testing.T) {
 	e := newEngine(t, baseConfig(t), client, model)
 
 	ch := make(chan Transition, 2)
-	ch <- Transition{Slot: "impl", To: herdr.StatusBlocked}
+	ch <- Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusBlocked}
 	close(ch)
 	if _, err := e.Run(context.Background(), ch); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
 	model.set("impl", herdr.StatusDone)
-	run(t, e, Transition{Slot: "impl", To: herdr.StatusDone})
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone})
 
 	if n := client.promptCount(); n != 0 {
 		t.Errorf("prompts = %d, want 0 — a halted slot must stay out of the fold", n)

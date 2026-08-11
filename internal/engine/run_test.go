@@ -264,3 +264,51 @@ func TestDecodeEscapes(t *testing.T) {
 		}
 	}
 }
+
+// A freshly spawned slot is idle, and idle satisfies "settled" — so a rule
+// keyed on "when this slot has finished" matched a slot that had never
+// started. Seen in a two-slot loop: the reviewer's gate ran before the
+// implementer was given its task, failed on untouched code, and sent that
+// failure back as feedback about work nobody had done.
+func TestRulesDoNotFireForASlotThatHasNeverWorked(t *testing.T) {
+	client := &fakeHerdr{}
+	// Both slots idle, as they are the moment they spawn.
+	model := newModel().set("impl", herdr.StatusIdle).set("review", herdr.StatusIdle)
+	e := newEngine(t, baseConfig(t), client, model)
+
+	// A transition that is NOT out of working — exactly what spawning
+	// produces.
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusUnknown, To: herdr.StatusIdle, At: time.Now()})
+
+	if n := client.promptCount(); n != 0 {
+		t.Fatalf("prompts = %d, want 0 — a slot that never worked has not finished anything", n)
+	}
+}
+
+// The same slot, once it has actually completed a turn, must fire normally.
+func TestRulesFireAfterATurnCompletes(t *testing.T) {
+	client := &fakeHerdr{}
+	model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
+	e := newEngine(t, baseConfig(t), client, model)
+
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone, At: time.Now()})
+
+	if n := client.promptCount(); n != 1 {
+		t.Fatalf("prompts = %d, want 1 — leaving working is a completed turn", n)
+	}
+}
+
+// A turn is recorded even when the transition that carried it is ignored for
+// another reason, so the slot is eligible next time round.
+func TestTurnIsRecordedEvenWhenTheTransitionIsIgnored(t *testing.T) {
+	client := &fakeHerdr{}
+	model := newModel().set("impl", herdr.StatusUnknown).set("review", herdr.StatusIdle)
+	e := newEngine(t, baseConfig(t), client, model)
+
+	// working -> unknown: a real turn ended, but unknown is not actionable.
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusUnknown, At: time.Now()})
+
+	if !e.hasWorked("impl") {
+		t.Error("turn not recorded because the transition was unactionable; the slot would stay ineligible forever")
+	}
+}

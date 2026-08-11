@@ -28,6 +28,12 @@ max_concurrent    = 1
 # a screen-classification guess. Keyless on free models, so concurrency costs
 # nothing and races no credential.
 max_concurrent = 3
+# opencode reports itself interactive before its TUI can accept input — herdr's
+# readiness is about the process, not about whether a text UI has finished
+# painting. Prompting into that gap goes nowhere and surfaces as
+# agent_prompt_stalled. Measured, not guessed: shorter waits reproduced the
+# stall.
+startup_settle_ms = 6000
 
 # ── Pi ────────────────────────────────────────────────────────────────────────
 [pi]
