@@ -66,3 +66,12 @@ func (noopModel) SlotTier(string) (state.Tier, bool) { return "", false }
 func (noopHerdr) PaneProcessInfo(context.Context, string) (herdr.PaneProcessInfo, error) {
 	return herdr.PaneProcessInfo{}, errors.New("validate: no live session")
 }
+
+// PaneSendText is never called during validate — no pane exists — but the
+// interface requires it.
+func (noopHerdr) PaneSendText(context.Context, string, string) error { return errNoConnection }
+
+// AgentGet is never called during validate — no agent exists.
+func (noopHerdr) AgentGet(context.Context, string) (herdr.Agent, error) {
+	return herdr.Agent{}, errNoConnection
+}

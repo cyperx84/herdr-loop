@@ -32,6 +32,8 @@ type fakeHerdr struct {
 	starts   []herdr.AgentStartParams
 	notified []herdr.NotificationShowParams
 
+	sentText      []string
+	sendTextErr   error
 	processProbes []string
 	procGone      bool
 	procErr       error
@@ -91,6 +93,25 @@ func (f *fakeHerdr) PaneSplit(_ context.Context, p herdr.PaneSplitParams) (herdr
 		hook()
 	}
 	return herdr.Pane{ID: id}, nil
+}
+
+// PaneSendText records startup key sequences so a test can assert what a
+// harness was actually sent.
+// AgentGet reports a ready agent for any pane an agent was started in.
+func (f *fakeHerdr) AgentGet(_ context.Context, target string) (herdr.Agent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.startedPanes[target] {
+		return herdr.Agent{PaneID: target, InteractiveReady: true}, nil
+	}
+	return herdr.Agent{PaneID: target, LaunchPending: true}, nil
+}
+
+func (f *fakeHerdr) PaneSendText(_ context.Context, paneID, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sentText = append(f.sentText, text)
+	return f.sendTextErr
 }
 
 func (f *fakeHerdr) NotificationShow(_ context.Context, p herdr.NotificationShowParams) (herdr.NotificationShowResult, error) {

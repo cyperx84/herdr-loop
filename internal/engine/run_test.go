@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -183,5 +184,83 @@ func TestRunActionSuccessBranchCanFinishTheLoop(t *testing.T) {
 
 	if out.Reason != "green" {
 		t.Errorf("outcome reason = %q, want green — an async branch could not end the loop", out.Reason)
+	}
+}
+
+// A harness can silently reinterpret the job: Claude Code in plan mode turns
+// "implement this" into "write a plan for this", reports working, reports
+// done, and changes nothing — so a gate fails forever on work never attempted.
+// Startup keys exist to prevent that, and must actually reach the pane.
+func TestStartupKeysAreSentBeforeTheFirstPrompt(t *testing.T) {
+	client := &fakeHerdr{}
+	model := newModel()
+
+	cfg := baseConfig(t)
+	cfg.Kinds = map[string]KindConfig{
+		"claude": {MaxConcurrent: 1, StartupKeys: []string{`\e[Z`}, StartupSettle: time.Millisecond},
+	}
+	e := newEngine(t, cfg, client, model)
+
+	if err := e.Spawn(context.Background(), "impl"); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	client.mu.Lock()
+	sent := append([]string(nil), client.sentText...)
+	client.mu.Unlock()
+
+	if len(sent) != 1 {
+		t.Fatalf("sent %d text sequences, want 1: %q", len(sent), sent)
+	}
+	// The literal escape byte must reach the pane, not the backslash-e spelling
+	// the TOML file carries.
+	if sent[0] != "\x1b[Z" {
+		t.Errorf("sent %q, want the decoded S-Tab escape \\x1b[Z — herdr rejects the key name, only the raw sequence works", sent[0])
+	}
+}
+
+// A kind with no measured startup sequence must be left alone, not sent
+// something invented.
+func TestNoStartupKeysForUnmeasuredKind(t *testing.T) {
+	client := &fakeHerdr{}
+	e := newEngine(t, baseConfig(t), client, newModel())
+
+	if err := e.Spawn(context.Background(), "impl"); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	client.mu.Lock()
+	n := len(client.sentText)
+	client.mu.Unlock()
+	if n != 0 {
+		t.Errorf("sent %d sequences to a kind with none configured", n)
+	}
+}
+
+// Losing a cosmetic keystroke must not fail a spawn: an agent that ignored the
+// sequence is no worse off than one never sent it.
+func TestStartupKeyFailureDoesNotFailTheSpawn(t *testing.T) {
+	client := &fakeHerdr{sendTextErr: errors.New("herdr: pane busy")}
+	cfg := baseConfig(t)
+	cfg.Kinds = map[string]KindConfig{
+		"claude": {StartupKeys: []string{`\e[Z`}, StartupSettle: time.Millisecond},
+	}
+	e := newEngine(t, cfg, client, newModel())
+
+	if err := e.Spawn(context.Background(), "impl"); err != nil {
+		t.Errorf("Spawn failed over an undelivered startup key: %v", err)
+	}
+}
+
+// The TOML spelling must survive the trip to the wire.
+func TestDecodeEscapes(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{`\e[Z`, "\x1b[Z"},
+		{`\x1b[Z`, "\x1b[Z"},
+		{`plain`, "plain"},
+		{`a\tb`, "a\tb"},
+	} {
+		if got := decodeEscapes(c.in); got != c.want {
+			t.Errorf("decodeEscapes(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }

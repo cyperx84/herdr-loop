@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/cyperx84/herdr-loop/internal/engine"
@@ -18,8 +19,10 @@ import (
 //	max_concurrent     = 2
 //	mid_turn_injection = false
 type kindsFile map[string]struct {
-	MaxConcurrent    int  `toml:"max_concurrent"`
-	MidTurnInjection bool `toml:"mid_turn_injection"`
+	MaxConcurrent    int      `toml:"max_concurrent"`
+	MidTurnInjection bool     `toml:"mid_turn_injection"`
+	StartupKeys      []string `toml:"startup_keys"`
+	StartupSettleMs  int      `toml:"startup_settle_ms"`
 }
 
 // loadKinds reads an optional kinds.toml. A missing file is not an error —
@@ -46,6 +49,8 @@ func loadKinds(path string) (map[string]engine.KindConfig, error) {
 		out[kind] = engine.KindConfig{
 			MaxConcurrent:    v.MaxConcurrent,
 			MidTurnInjection: v.MidTurnInjection,
+			StartupKeys:      v.StartupKeys,
+			StartupSettle:    time.Duration(v.StartupSettleMs) * time.Millisecond,
 		}
 	}
 	return out, nil

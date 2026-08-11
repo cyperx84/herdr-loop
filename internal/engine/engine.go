@@ -70,6 +70,12 @@ type Herdr interface {
 	AgentStart(ctx context.Context, params herdr.AgentStartParams) (herdr.AgentStartResult, error)
 	PaneSplit(ctx context.Context, params herdr.PaneSplitParams) (herdr.Pane, error)
 	NotificationShow(ctx context.Context, params herdr.NotificationShowParams) (herdr.NotificationShowResult, error)
+	// PaneSendText writes raw text to a pane. Needed for control sequences
+	// herdr's key vocabulary does not cover — S-Tab among them.
+	PaneSendText(ctx context.Context, paneID, text string) error
+	// AgentGet reads one agent's current record. Used to wait for a
+	// just-started agent to become interactive before anything is sent to it.
+	AgentGet(ctx context.Context, target string) (herdr.Agent, error)
 	// PaneProcessInfo is the corroboration channel required by PLAN §4.9.
 	// Re-reading the state model proves nothing: it returns the same
 	// inference that is under suspicion. Asking herdr what process is
@@ -161,6 +167,24 @@ type KindConfig struct {
 	// Off until measured (§4.4): agent.prompt tracks lifecycle state, not
 	// turn boundaries, and where the text lands mid-turn differs per kind.
 	MidTurnInjection bool
+	// StartupKeys are sent to a freshly started agent of this kind, before
+	// its first prompt, to put its UI into a state where work actually
+	// happens.
+	//
+	// This exists because a harness can silently reinterpret the job. Claude
+	// Code launched in plan mode turns "implement this" into "write a plan
+	// for this": the agent reports working, finishes, and reports done,
+	// having changed nothing — a loop gate then fails forever on work that
+	// was never attempted, and nothing in the lifecycle says why.
+	//
+	// Sent through pane.send_text rather than agent.send_keys because the
+	// sequences that matter are raw terminal input: herdr rejects S-Tab and
+	// BackTab as unsupported keys, while the escape sequence they stand for
+	// goes through unchanged.
+	StartupKeys []string
+	// StartupSettle is how long to wait after StartupKeys before prompting,
+	// letting the UI redraw. Zero means DefaultStartupSettle.
+	StartupSettle time.Duration
 }
 
 // SlotConfig is a named seat for an agent.
@@ -992,6 +1016,87 @@ func (e *Engine) SendPrompt(ctx context.Context, target, text string) error {
 	return e.sendPrompt(ctx, target, text)
 }
 
+// waitInteractive blocks until herdr reports the agent in a pane is past its
+// launch-pending seat and ready for input.
+func (e *Engine) waitInteractive(ctx context.Context, paneID string) error {
+	deadline := time.Now().Add(AgentReadyTimeout)
+	for {
+		a, err := e.client.AgentGet(ctx, paneID)
+		if err == nil && a.InteractiveReady && !a.LaunchPending {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("agent.get %s: %w", paneID, err)
+			}
+			return fmt.Errorf("agent in pane %s not interactive within %s", paneID, AgentReadyTimeout)
+		}
+		select {
+		case <-time.After(250 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// DefaultStartupSettle gives a harness's UI time to redraw after startup keys
+// before the first prompt is delivered.
+const DefaultStartupSettle = 400 * time.Millisecond
+
+// applyStartupKeys puts a freshly started agent into a workable state.
+//
+// Failures are logged, never fatal: a harness that ignores the sequence is no
+// worse off than one that was never sent it, and refusing to run the loop over
+// a cosmetic keystroke would be the wrong trade.
+func (e *Engine) applyStartupKeys(ctx context.Context, slot, paneID string) {
+	kc := e.kindConfig(e.slots[slot].Kind)
+	if len(kc.StartupKeys) == 0 {
+		return
+	}
+	// Wait for the harness to actually be interactive first. agent.start
+	// returns a launch-pending seat, so sending immediately writes into a
+	// terminal whose TUI has not started — the bytes are swallowed and the
+	// mode they were meant to change stays on. Observed exactly that with
+	// Claude Code: the sequence went out, plan mode remained, and the agent
+	// produced a plan and an approval dialog instead of an edit.
+	if err := e.waitInteractive(ctx, paneID); err != nil {
+		e.log.Warn("startup keys skipped: agent never became interactive",
+			"slot", slot, "pane", paneID, "err", err)
+		return
+	}
+	for _, seq := range kc.StartupKeys {
+		if err := e.client.PaneSendText(ctx, paneID, decodeEscapes(seq)); err != nil {
+			e.log.Warn("startup key not delivered", "slot", slot, "pane", paneID, "err", err)
+			return
+		}
+	}
+	settle := kc.StartupSettle
+	if settle <= 0 {
+		settle = DefaultStartupSettle
+	}
+	select {
+	case <-time.After(settle):
+	case <-ctx.Done():
+	}
+	e.log.Debug("startup keys applied", "slot", slot, "pane", paneID, "count", len(kc.StartupKeys))
+}
+
+// decodeEscapes expands the backslash escapes a TOML manifest can carry, so a
+// kinds file can spell a control sequence readably as "\e[Z" rather than
+// embedding a literal escape byte no editor will show.
+func decodeEscapes(s string) string {
+	return escapeDecoder.Replace(s)
+}
+
+// escapeDecoder is built once: the set is fixed and small.
+var escapeDecoder = strings.NewReplacer(
+	"\\e", "\x1b",
+	"\\x1b", "\x1b",
+	"\\r", "\r",
+	"\\n", "\n",
+	"\\t", "\t",
+)
+
 // AgentReadyTimeout bounds the wait for a just-started agent to become
 // addressable by name.
 const AgentReadyTimeout = 30 * time.Second
@@ -1109,6 +1214,10 @@ func (e *Engine) Spawn(ctx context.Context, slot string) error {
 	if err := e.startAgent(ctx, slot, sc, pane.ID); err != nil {
 		return err
 	}
+	// Before anything is asked of it: put the harness into a state where the
+	// answer will be work rather than a description of work.
+	e.applyStartupKeys(ctx, slot, pane.ID)
+
 	// Publish the mapping before returning, so a transition arriving in the
 	// next moment can be attributed to this slot.
 	if e.cfg.OnSpawn != nil {

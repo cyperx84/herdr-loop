@@ -1,0 +1,48 @@
+# Per-harness capabilities for herdr-loop.
+#
+# Everything here is a measured property of a specific coding agent, kept as
+# data rather than code so adding a harness is an edit, not a release. Copy
+# this file next to a manifest and adjust; anything absent falls back to
+# conservative defaults.
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+[claude]
+# Plan mode turns "implement this" into "write a plan for this". The agent
+# reports working, finishes, reports done, and has changed nothing — a loop
+# then fails its gate forever on work that was never attempted, with nothing in
+# the lifecycle explaining why. Shift-Tab cycles the mode off.
+#
+# Sent as the raw escape sequence rather than a key name on purpose: herdr
+# rejects both S-Tab and BackTab as unsupported keys, while the sequence they
+# stand for goes through pane.send_text untouched.
+startup_keys      = ["\\e[Z"]
+startup_settle_ms = 500
+# One at a time. Concurrent Claude Code processes race a single rotating OAuth
+# credential with no lock — an upstream bug with many reporters and no fix, so
+# the mitigation here is simply not to create the race.
+max_concurrent    = 1
+
+# ── OpenCode ──────────────────────────────────────────────────────────────────
+[opencode]
+# Self-reports its lifecycle state, so its status is an observation rather than
+# a screen-classification guess. Keyless on free models, so concurrency costs
+# nothing and races no credential.
+max_concurrent = 3
+
+# ── Pi ────────────────────────────────────────────────────────────────────────
+[pi]
+# Also self-reporting. Keep the cap low: pi routes through a subscription.
+max_concurrent = 1
+
+# ── Codex ─────────────────────────────────────────────────────────────────────
+[codex]
+# Screen-classified, so a strict loop will refuse it until that changes
+# upstream. Shares a ChatGPT credential, hence one at a time.
+max_concurrent = 1
+
+# ── Everything else ───────────────────────────────────────────────────────────
+# gemini, cursor, amp, droid, kimi, grok, hermes, copilot, kilo, qodercli,
+# maki, cline, agy, omp, devin, kiro, mastracode all work without an entry —
+# they inherit max_concurrent = 1 and no startup keys, which is the safe
+# assumption for a harness nobody has measured. Add a section when you have
+# measured one, and say what you measured.
