@@ -2,86 +2,78 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# herdr-loop's go.mod carries `replace github.com/cyperx84/herdr-api => ../herdr-api`
-# because herdr-api isn't published yet. Every job below checks out both repos as
-# siblings and runs with herdr-loop as the working directory, so that replace
-# directive resolves exactly the way it does on a contributor's machine.
-
 jobs:
   test:
+    name: test
     runs-on: ubuntu-latest
     steps:
-      - name: Check out herdr-loop
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: herdr-loop
-
-      - name: Check out herdr-api (sibling, for the go.mod replace directive)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: cyperx84/herdr-api
-          path: herdr-api
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: herdr-loop/go.mod
+          go-version-file: go.mod
+          cache: true
 
       - name: gofmt
-        working-directory: herdr-loop
         run: |
-          fmt_out="$(gofmt -l .)"
-          if [ -n "$fmt_out" ]; then
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
             echo "gofmt needs to be run on:"
-            echo "$fmt_out"
+            echo "$out"
             exit 1
           fi
 
-      - name: go vet
-        working-directory: herdr-loop
+      - name: vet
         run: go vet ./...
 
-      - name: go test
-        working-directory: herdr-loop
-        run: go test ./...
+      # -race, not a plain test run: this engine drives concurrent actions
+      # across goroutines and a data race here corrupts a loop's state model
+      # rather than crashing loudly.
+      - name: test
+        run: go test -race -count=1 ./...
+
+      # Every shipped example must pass the binary's own validator. An example
+      # the tool rejects reads as a broken build, and it is the first thing a
+      # new user runs.
+      - name: examples validate
+        run: |
+          go build -o /tmp/herdr-loop ./cmd/herdr-loop
+          for f in examples/*.toml; do
+            echo "--- $f"
+            /tmp/herdr-loop validate --kinds kinds.toml "$f"
+          done
 
   cross-compile:
+    name: cross-compile
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - goos: darwin
-            goarch: arm64
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: windows
-            goarch: amd64
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: linux,   goarch: amd64 }
+          - { goos: windows, goarch: amd64 }
     steps:
-      - name: Check out herdr-loop
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: herdr-loop
-
-      - name: Check out herdr-api (sibling, for the go.mod replace directive)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: cyperx84/herdr-api
-          path: herdr-api
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: herdr-loop/go.mod
+          go-version-file: go.mod
+          cache: true
 
-      - name: build (${{ matrix.goos }}/${{ matrix.goarch }})
-        working-directory: herdr-loop
+      # herdr runs on all three platforms, and the socket transport differs per
+      # platform (unix socket vs named pipe), so a build that only works on the
+      # developer's machine is a real risk rather than a theoretical one.
+      - name: build ${{ matrix.goos }}/${{ matrix.goarch }}
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
         run: go build ./...

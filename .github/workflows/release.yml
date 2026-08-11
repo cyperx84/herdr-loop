@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # These assets are what scripts/build.sh downloads when a machine has no
+      # Go toolchain. Without them that fallback is dead and the plugin only
+      # installs for people who can build it — which is most of the point of
+      # having the fallback at all.
+      #
+      # Asset names and the tar layout must match what build.sh expects:
+      #   herdr-loop-<tag>-<goos>-<goarch>.tar.gz  containing  herdr-loop
+      - name: build release assets
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -eu
+          mkdir -p dist
+          for target in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
+            goos=${target%-*}
+            goarch=${target#*-}
+            echo "building $target"
+            GOOS=$goos GOARCH=$goarch CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w" -o "dist/herdr-loop" ./cmd/herdr-loop
+            tar -czf "dist/herdr-loop-${VERSION}-${target}.tar.gz" -C dist herdr-loop
+            rm dist/herdr-loop
+          done
+          cd dist && sha256sum *.tar.gz | tee SHA256SUMS
+
+      # Printed into the job log so the checksums pinned in scripts/build.sh can
+      # be updated from a verifiable source rather than copied by hand from a
+      # local build that nobody else can reproduce.
+      - name: checksums for scripts/build.sh
+        run: |
+          echo "Pin these in scripts/build.sh expected_sha256():"
+          awk '{ split($2, p, "-"); n=split($2, q, "-"); target=q[n-1]"-"substr(q[n],1,index(q[n],".")-1); printf "  %-14s %s\n", target, $1 }' dist/SHA256SUMS
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            dist/*.tar.gz dist/SHA256SUMS
