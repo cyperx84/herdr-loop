@@ -237,6 +237,28 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the sibling-checkout requirement and 
 package's tests actually need to cover.
 
 
+
+## Harness support
+
+Four harnesses are measured and exercised in real loops. Probe results against
+herdr 0.8.0:
+
+| kind | detection | interactive | first turn | notes |
+|---|---|---|---|---|
+| `pi` | structured | 3.13s | 0.50s | fastest; best default for a reviewer slot |
+| `opencode` | structured | 3.12s | 33.54s | slow turns; keyless on free models |
+| `claude` | screen | 3.02s | 2.51s | needs plan-mode disarm, or it plans instead of building |
+| `codex` | screen | 3.02s | 1.00s | asks to trust a new directory on first run |
+
+**Structured** means the agent reports its own lifecycle state. **Screen** means
+herdr infers it from the rendered terminal — a heuristic, and one `strict` mode
+refuses to act on. As of herdr 0.8.0 a strict loop therefore runs on `pi` and
+`opencode` only.
+
+Every other kind herdr recognises should work and inherits conservative
+defaults, but none has been probed. Run `herdr-loop probe <kind>` and add what
+it prints.
+
 ## Measuring a harness
 
 Loop orchestration lives or dies on per-harness behaviour: whether an agent

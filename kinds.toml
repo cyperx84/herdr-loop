@@ -1,9 +1,28 @@
 # Per-harness capabilities for herdr-loop.
 #
-# Everything here is a measured property of a specific coding agent, kept as
-# data rather than code so adding a harness is an edit, not a release. Copy
-# this file next to a manifest and adjust; anything absent falls back to
-# conservative defaults.
+# Everything here is MEASURED, not assumed. Each entry came from
+# `herdr-loop probe <kind>`, which runs the harness through the same lifecycle
+# the engine runs and reports what it actually did. Re-run the probe after a
+# harness updates rather than trusting this file to have aged well.
+#
+# Kinds with no entry still work: they inherit max_concurrent = 1 and no
+# startup sequence, which is the safe assumption for a harness nobody has
+# measured. Probe one and add it.
+#
+# ── Verified tier ─────────────────────────────────────────────────────────────
+# Four harnesses are measured and exercised in real loops. Probe results,
+# herdr 0.8.0, 2026-08-11:
+#
+#   kind      detection    interactive   first turn   notes
+#   pi        structured   3.13s         0.50s        fastest; best reviewer
+#   opencode  structured   3.12s         33.54s       slow turns, no settle needed
+#   claude    screen       3.02s         2.51s        needs plan-mode disarm
+#   codex     screen       3.02s         1.00s        1 retry on pane readiness
+#
+# "structured" means the agent reports its own lifecycle state. "screen" means
+# herdr infers it from the rendered terminal — a heuristic, and one a strict
+# loop refuses to act on (PLAN.md §4.6). As of herdr 0.8.0 that means a strict
+# loop runs on pi and opencode only.
 
 # ── Claude Code ───────────────────────────────────────────────────────────────
 [claude]
@@ -12,7 +31,7 @@
 # then fails its gate forever on work that was never attempted, with nothing in
 # the lifecycle explaining why. Shift-Tab cycles the mode off.
 #
-# Sent as the raw escape sequence rather than a key name on purpose: herdr
+# Sent as a raw escape sequence rather than a key name on purpose: herdr
 # rejects both S-Tab and BackTab as unsupported keys, while the sequence they
 # stand for goes through pane.send_text untouched.
 startup_keys      = ["\\e[Z"]
@@ -22,44 +41,43 @@ startup_settle_ms = 500
 # the mitigation here is simply not to create the race.
 max_concurrent    = 1
 
-# ── OpenCode ──────────────────────────────────────────────────────────────────
-[opencode]
-# Self-reports its lifecycle state, so its status is an observation rather than
-# a screen-classification guess. Keyless on free models, so concurrency costs
-# nothing and races no credential.
-max_concurrent = 3
-# No settle needed — `herdr-loop probe opencode` takes a prompt immediately and
-# completes a turn in ~34s.
-#
-# An earlier entry here set startup_settle_ms = 6000 on the strength of
-# hand-observed stalls. The probe disproved it: those stalls were the pane
-# being squeezed to a sliver by repeated splitting, not a readiness gap, and
-# they disappeared once slots got their own tab. Recorded because it is the
-# argument for probing rather than remembering — a hand-measured table encodes
-# whatever the measurer happened to have wrong.
-
 # ── Pi ────────────────────────────────────────────────────────────────────────
 [pi]
-# Also self-reporting, and the most reliable reviewer measured so far: it takes
-# a prompt and completes a turn without a settle delay or a startup sequence.
-# Keep the cap low — pi routes through a subscription.
+# The most reliable harness measured: takes a prompt immediately, finishes a
+# turn in well under a second, and self-reports its state. Best default for a
+# reviewer slot. Keep the cap low — pi routes through a subscription.
 max_concurrent = 1
+
+# ── OpenCode ──────────────────────────────────────────────────────────────────
+[opencode]
+# Self-reporting, and keyless on free models, so concurrency here races no
+# credential and costs nothing.
+max_concurrent = 3
+# Turns are slow — ~34s in the probe, and minutes against a busy free endpoint.
+# A loop stays healthy and simply waits, which is correct, but do not put
+# opencode on the critical path of something you are watching.
+#
+# No settle needed. An earlier version of this file claimed
+# startup_settle_ms = 6000 on the strength of hand-observed stalls; the probe
+# disproved it. Those stalls were the pane being squeezed to a sliver by
+# repeated splitting, fixed since by giving each slot its own tab. Recorded
+# because it is the argument for probing rather than remembering.
 
 # ── Codex ─────────────────────────────────────────────────────────────────────
 [codex]
 # Screen-classified, so a strict loop will refuse it until that changes
 # upstream. Shares a ChatGPT credential, hence one at a time.
 max_concurrent = 1
-# Codex asks "do you trust the contents of this directory?" the first time it
-# starts anywhere new, and that lands as `blocked`. The loop escalates and
-# halts the slot rather than answering — pressing enter there would be an agent
-# granting itself trust over a directory, which is the whole reason
-# escalate-by-default exists. Trust the directory yourself, once, before
-# putting codex in a loop:  codex  (then answer it) in that directory.
+# The first time codex starts in a directory it has not seen, it asks whether
+# it trusts the contents — a prompt-injection warning — and that lands as
+# `blocked`. The loop escalates and halts the slot rather than answering:
+# pressing enter there would be an agent granting itself trust over contents it
+# was explicitly warned about. Answer it yourself once, in that directory,
+# before putting codex in a loop.
 
 # ── Everything else ───────────────────────────────────────────────────────────
 # gemini, cursor, amp, droid, kimi, grok, hermes, copilot, kilo, qodercli,
-# maki, cline, agy, omp, devin, kiro, mastracode all work without an entry —
-# they inherit max_concurrent = 1 and no startup keys, which is the safe
-# assumption for a harness nobody has measured. Add a section when you have
-# measured one, and say what you measured.
+# maki, cline, agy, omp, devin, kiro, mastracode are recognised by herdr and
+# should work, but none has been probed. Run `herdr-loop probe <kind>` and add
+# what it prints — an unmeasured claim in this file would be exactly the kind
+# of thing the probe exists to stop.
