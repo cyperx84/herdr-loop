@@ -24,6 +24,11 @@ command = ["sh", "scripts/build.sh"]
 platforms = ["windows"]
 command = ["go", "build", "-o", "bin/herdr-loop.exe", "./cmd/herdr-loop"]
 
+# Paths are "./bin/..." rather than "bin/...": herdr resolves a bare relative
+# command through PATH, not the plugin root, so the unprefixed form silently
+# fails to launch for anyone who installs this. Learned from herdr-sesh-bro,
+# where exactly this broke every action and the startup hook.
+#
 # Every action shells out to the same binary [[build]] produced. None of these
 # take user-entered arguments — herdr actions have no argument prompt UI as of
 # 0.8.0. `run` takes no manifest argument here on purpose: [config] values
@@ -38,21 +43,21 @@ id = "run"
 title = "herdr-loop: run"
 description = "Start the loop defined in the configured manifest"
 contexts = ["workspace"]
-command = ["bin/herdr-loop", "run"]
+command = ["./bin/herdr-loop", "run"]
 
 [[actions]]
 id = "status"
 title = "herdr-loop: status"
 description = "Show the live state of the running loop, if any"
 contexts = ["workspace", "global"]
-command = ["bin/herdr-loop", "status"]
+command = ["./bin/herdr-loop", "status"]
 
 [[actions]]
 id = "stop"
 title = "herdr-loop: stop"
 description = "Stop the running loop"
 contexts = ["workspace", "global"]
-command = ["bin/herdr-loop", "stop"]
+command = ["./bin/herdr-loop", "stop"]
 
 # Status board: a persistent pane the supervisor's `run` invocation lives in
 # (PLAN.md §2 — herdr owns the lifecycle, it dies with the server, it is
@@ -68,7 +73,7 @@ title = "herdr-loop"
 placement = "split"
 direction = "down"
 height = "30%"
-command = ["bin/herdr-loop", "run"]
+command = ["./bin/herdr-loop", "run"]
 
 # Reaches the process as HERDR_LOOP_DEFAULT_MANIFEST / HERDR_LOOP_KINDS_FILE /
 # HERDR_LOOP_RECONCILE_INTERVAL_SECS / HERDR_LOOP_LOG_LEVEL — herdr uppercases
