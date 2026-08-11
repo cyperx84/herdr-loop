@@ -91,9 +91,18 @@ func cmdGraph(ctx context.Context, args []string) error {
 					"note", "raise graph.max_iterations if the work genuinely needs more rounds")
 				break
 			}
-			// Already running, or failed and not restartable. Neither is
-			// fatal to the graph — skip and let the rest proceed.
-			log.Info("node not activated", "node", name, "err", err)
+			switch {
+			case errors.Is(err, graph.ErrNodeAlreadyRunning):
+				// Fan-in: two edges converged on this node and the first one
+				// already started it. That is the join working, not a fault.
+				log.Debug("node already running; join absorbed the second edge", "node", name)
+			case errors.Is(err, graph.ErrNodeFailed):
+				log.Info("node already failed; not restarting", "node", name)
+			default:
+				// Anything else is a real fault in the graph, not an ordinary
+				// declined activation, and swallowing it would hide a bug.
+				return fmt.Errorf("graph: %w", err)
+			}
 			continue
 		}
 

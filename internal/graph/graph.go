@@ -145,7 +145,51 @@ func (g *Graph) Validate() error {
 	if err := g.validateReachable(names); err != nil {
 		return err
 	}
-	return g.validateCycles()
+	if err := g.validateCycles(); err != nil {
+		return err
+	}
+	return g.validateBudgetCoversNodes()
+}
+
+// validateBudgetCoversNodes rejects a budget too small to run the graph once.
+//
+// max_iterations bounds activations, and every reachable node needs at least
+// one. A budget below that count does not fail loudly — it truncates the run
+// partway through, leaving later nodes pending while the graph reports a
+// perfectly ordinary finish. Someone writing max_iterations = 2 on a five-node
+// pipeline means "do not loop forever", not "run two of my five nodes", and
+// nothing at runtime would tell them which they got.
+func (g *Graph) validateBudgetCoversNodes() error {
+	if g.MaxIterations <= 0 {
+		return nil // unbounded is legal for an acyclic graph; cycles are caught above
+	}
+	reachable := g.reachableFromEntry()
+	if g.MaxIterations < len(reachable) {
+		return fmt.Errorf("graph: max_iterations = %d is below the %d reachable node(s): the run would stop partway through rather than loop; raise it to at least %d",
+			g.MaxIterations, len(reachable), len(reachable))
+	}
+	return nil
+}
+
+// reachableFromEntry returns every node reachable from the entry node.
+func (g *Graph) reachableFromEntry() map[string]bool {
+	adj := map[string][]string{}
+	for _, e := range g.Edges {
+		adj[e.From] = append(adj[e.From], e.To)
+	}
+	seen := map[string]bool{}
+	var walk func(string)
+	walk = func(n string) {
+		if seen[n] {
+			return
+		}
+		seen[n] = true
+		for _, next := range adj[n] {
+			walk(next)
+		}
+	}
+	walk(g.Entry)
+	return seen
 }
 
 // validateReachable requires an entry node, and requires every other node to
@@ -345,6 +389,20 @@ const (
 // Graph.MaxIterations nodes. Validate proves a bound exists; this enforces it.
 var ErrBudgetExhausted = errors.New("activation budget exhausted")
 
+// ErrNodeAlreadyRunning and ErrNodeFailed are the two ordinary reasons an
+// activation is declined, and they are sentinels because a driver has to tell
+// them apart from a real fault.
+//
+// Fan-in makes this routine rather than exotic: two edges converging on one
+// node both try to activate it, and the second arrival is not an error in the
+// graph — it is the join working. A driver that cannot distinguish "already
+// running, carry on" from "this graph is broken" has to either treat every
+// declined activation as fatal or ignore all of them, and both are wrong.
+var (
+	ErrNodeAlreadyRunning = errors.New("node is already running")
+	ErrNodeFailed         = errors.New("node failed and is not restartable")
+)
+
 // NodeStatus is a run's record of one node.
 type NodeStatus struct {
 	State NodeState
@@ -449,9 +507,9 @@ func (r *Run) Activate(name string) error {
 	}
 	switch s.State {
 	case NodeRunning:
-		return fmt.Errorf("graph: activate %q: node is already running", name)
+		return fmt.Errorf("graph: activate %q: %w", name, ErrNodeAlreadyRunning)
 	case NodeFailed:
-		return fmt.Errorf("graph: activate %q: node failed and is not restartable", name)
+		return fmt.Errorf("graph: activate %q: %w", name, ErrNodeFailed)
 	}
 	if r.graph.MaxIterations > 0 && r.activations >= r.graph.MaxIterations {
 		return fmt.Errorf("graph: activate %q: %w (max_iterations = %d)", name, ErrBudgetExhausted, r.graph.MaxIterations)

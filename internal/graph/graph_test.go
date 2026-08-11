@@ -528,3 +528,69 @@ func TestHoldsForOutcome(t *testing.T) {
 }
 
 func ptr(p Predicate) *Predicate { return &p }
+
+// A budget below the number of reachable nodes truncates the run instead of
+// bounding a loop, and does it silently: later nodes stay pending and the
+// graph reports an ordinary finish. Someone writing max_iterations = 2 on a
+// five-node pipeline means "do not loop forever", not "run two of my nodes".
+func TestValidateRejectsBudgetSmallerThanTheGraph(t *testing.T) {
+	g := Graph{
+		Entry: "a",
+		Nodes: []Node{{Name: "a", Loop: "a.toml"}, {Name: "b", Loop: "b.toml"}, {Name: "c", Loop: "c.toml"}},
+		Edges: []Edge{{From: "a", To: "b"}, {From: "b", To: "c"}},
+	}
+
+	g.MaxIterations = 2
+	err := g.Validate()
+	if err == nil {
+		t.Fatal("a budget of 2 was accepted for 3 reachable nodes; the run would stop partway through")
+	}
+	if !strings.Contains(err.Error(), "3") {
+		t.Errorf("error should name the number of nodes to raise the budget to; got: %v", err)
+	}
+
+	g.MaxIterations = 3
+	if err := g.Validate(); err != nil {
+		t.Errorf("a budget equal to the node count must be accepted: %v", err)
+	}
+
+	// Unbounded stays legal for an acyclic graph — only cycles require a cap.
+	g.MaxIterations = 0
+	if err := g.Validate(); err != nil {
+		t.Errorf("an acyclic graph needs no budget: %v", err)
+	}
+}
+
+// Fan-in is the ordinary case, not an exotic one: two edges converge and the
+// second activation is declined. A driver must be able to tell that apart from
+// a genuine fault, which means a sentinel rather than a formatted string.
+func TestDeclinedActivationsAreDistinguishable(t *testing.T) {
+	g := Graph{
+		Entry: "a",
+		Nodes: []Node{{Name: "a", Loop: "a.toml"}, {Name: "b", Loop: "b.toml"}},
+		Edges: []Edge{{From: "a", To: "b"}},
+	}
+	if err := g.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	r, err := NewRun(&g)
+	if err != nil {
+		t.Fatalf("NewRun: %v", err)
+	}
+
+	if err := r.Activate("a"); err != nil {
+		t.Fatalf("first activation: %v", err)
+	}
+	err = r.Activate("a")
+	if !errors.Is(err, ErrNodeAlreadyRunning) {
+		t.Errorf("re-activating a running node = %v, want ErrNodeAlreadyRunning so a join can absorb it", err)
+	}
+
+	if err := r.Fail("a", errors.New("boom")); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+	err = r.Activate("a")
+	if !errors.Is(err, ErrNodeFailed) {
+		t.Errorf("re-activating a failed node = %v, want ErrNodeFailed", err)
+	}
+}
