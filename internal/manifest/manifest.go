@@ -46,6 +46,17 @@ type Loop struct {
 	// §4.2). Off by default: two agents sharing a working tree produces
 	// amend-becomes-new-commit and phantom modifications neither agent made.
 	AllowSharedCWD bool `toml:"allow_shared_cwd"`
+	// Strict refuses to fire any rule against a slot whose status herdr
+	// inferred by classifying the rendered screen rather than the agent
+	// self-reporting it (PLAN.md §4.6).
+	//
+	// Off by default, and the reason is worth stating: as of herdr 0.8.0 only
+	// pi and opencode self-report, so a strict loop over Claude Code or Codex
+	// slots will not fire at all. That is the honest consequence of what is
+	// measurable today. Turn it on for loops where acting on a wrong "done"
+	// costs more than not acting — anything that merges, publishes, or
+	// deletes.
+	Strict bool `toml:"strict"`
 }
 
 // Worktree gives a slot its own checkout, so its agent never shares a

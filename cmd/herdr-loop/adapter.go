@@ -132,3 +132,19 @@ func (a modelAdapter) SlotTarget(slot string) (string, bool) {
 func (a modelAdapter) BlockedPrompt(slot string) (string, bool) {
 	return "", false
 }
+
+// SlotTier reports how herdr learned this slot's status. False when the slot
+// has no known pane yet or the model no longer tracks it — the same
+// unresolved-lookup rule SlotStatus follows, so a caller can never mistake
+// "not tracked" for "screen-classified".
+func (a modelAdapter) SlotTier(slot string) (state.Tier, bool) {
+	pane, ok := a.idx.paneFor(slot)
+	if !ok {
+		return "", false
+	}
+	ag, ok := a.state.Get(pane)
+	if !ok {
+		return "", false
+	}
+	return ag.Tier, true
+}

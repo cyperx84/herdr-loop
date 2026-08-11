@@ -585,3 +585,36 @@ then = { prompt = { slot = "impl", text = "go" } }
 		t.Fatalf("Parse error = %q, want it to mention the missing retry cap", err.Error())
 	}
 }
+
+// strict must survive parsing: it is the difference between a loop that
+// refuses to act on a heuristic status and one that does not (PLAN §4.6).
+func TestParseStrictFlag(t *testing.T) {
+	const src = `
+[loop]
+name = "s"
+max_iterations = 3
+strict = true
+
+[[slot]]
+name = "a"
+kind = "opencode"
+cwd = "/tmp/a"
+`
+	m, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !m.Loop.Strict {
+		t.Error("strict = false after parsing strict = true")
+	}
+
+	// Absent means off, and that default is deliberate: strict would exclude
+	// every screen-classified kind, which today is most of them.
+	m2, err := Parse([]byte("[loop]\nname = \"s\"\nmax_iterations = 3\n\n[[slot]]\nname = \"a\"\nkind = \"opencode\"\ncwd = \"/tmp/a\"\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if m2.Loop.Strict {
+		t.Error("strict defaulted to true; it must be opt-in")
+	}
+}

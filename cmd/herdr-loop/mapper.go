@@ -73,6 +73,7 @@ func mapManifest(m *manifest.Manifest) (mapResult, error) {
 		MaxIterations: m.Loop.MaxIterations,
 		HandoffDir:    m.Loop.HandoffDir,
 		OnBlocked:     engine.BlockedPolicy(m.Loop.OnBlocked),
+		Strict:        m.Loop.Strict,
 		Vars:          map[string]string{},
 	}
 	if cfg.MaxIterations <= 0 {

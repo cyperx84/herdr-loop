@@ -8,6 +8,7 @@ import (
 
 	herdr "github.com/cyperx84/herdr-api"
 	"github.com/cyperx84/herdr-loop/internal/engine"
+	"github.com/cyperx84/herdr-loop/internal/state"
 )
 
 // errNoConnection is returned by every noopHerdr method. validate never
@@ -52,4 +53,16 @@ var _ engine.Model = noopModel{}
 // nothing to say about a construction check that never runs a loop.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// SlotTier reports an untracked slot: validate builds no state, so nothing is
+// known about detection tiers. Reporting false rather than a fabricated tier
+// keeps validate from accidentally passing a strict manifest it cannot check.
+func (noopModel) SlotTier(string) (state.Tier, bool) { return "", false }
+
+// PaneProcessInfo is never called during validate — no pane exists — but the
+// interface requires it. Returning an error rather than a zero value means a
+// corroboration check reached in error fails closed.
+func (noopHerdr) PaneProcessInfo(context.Context, string) (herdr.PaneProcessInfo, error) {
+	return herdr.PaneProcessInfo{}, errors.New("validate: no live session")
 }

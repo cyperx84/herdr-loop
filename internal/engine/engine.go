@@ -42,6 +42,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	herdr "github.com/cyperx84/herdr-api"
+	"github.com/cyperx84/herdr-loop/internal/state"
 	"gopkg.in/yaml.v3"
 )
 
@@ -69,6 +70,11 @@ type Herdr interface {
 	AgentStart(ctx context.Context, params herdr.AgentStartParams) (herdr.AgentStartResult, error)
 	PaneSplit(ctx context.Context, params herdr.PaneSplitParams) (herdr.Pane, error)
 	NotificationShow(ctx context.Context, params herdr.NotificationShowParams) (herdr.NotificationShowResult, error)
+	// PaneProcessInfo is the corroboration channel required by PLAN §4.9.
+	// Re-reading the state model proves nothing: it returns the same
+	// inference that is under suspicion. Asking herdr what process is
+	// actually in the pane is independent evidence.
+	PaneProcessInfo(ctx context.Context, paneID string) (herdr.PaneProcessInfo, error)
 }
 
 // Compile-time proof the interface still tracks the real client: if herdr-api
@@ -106,6 +112,12 @@ type Model interface {
 	// herdr's own classifier saw it. False when the model cannot see it —
 	// which the auto blocked policy treats as unmatched, never as consent.
 	BlockedPrompt(slot string) (string, bool)
+	// SlotTier reports how herdr learned this slot's status: structured
+	// self-reporting, or heuristic screen classification (PLAN §4.6). The
+	// distinction is load-bearing — a screen-classified "done" is an
+	// inference, not an observation — so it must survive the trip from the
+	// state model to the rules rather than being flattened here.
+	SlotTier(slot string) (state.Tier, bool)
 }
 
 // BlockedPolicy decides what happens when a slot reaches herdr.StatusBlocked —
@@ -249,6 +261,13 @@ type Config struct {
 	// MaxIterations bounds total rule firings. Must be positive: a loop that
 	// can run forever is a config error (§3).
 	MaxIterations int
+	// Strict refuses to fire any rule against a slot whose status herdr
+	// derived by classifying the rendered screen rather than by the agent
+	// self-reporting it (PLAN §4.6). Off by default: as of herdr 0.8.0 only
+	// pi and opencode self-report, so strict excludes Claude Code and Codex
+	// entirely. Turn it on for loops where acting on a wrong "done" is worse
+	// than not acting at all.
+	Strict bool
 	// HandoffDir holds the per-slot result files.
 	HandoffDir   string
 	OnBlocked    BlockedPolicy
@@ -630,6 +649,17 @@ func (e *Engine) fire(ctx context.Context, r Rule, f *facts, tr Transition) (Out
 		}
 	}
 
+	// §4.9: confirm the inferred status against independent evidence before
+	// spending an iteration on it. Placed after the lock so a corroboration
+	// probe cannot race a concurrent action, and before the budget so a
+	// refused action is free.
+	if slot, needsSlot := actionSlot(r.Then); needsSlot && !e.corroborate(ctx, r, slot) {
+		if lk != nil {
+			lk.Unlock()
+		}
+		return Outcome{}, false
+	}
+
 	// The budget is enforced here as well as by the manifest validator.
 	// Parse-time cycle detection proves a manifest cannot loop forever; it
 	// does not prove the manifest running now is the one that was validated,
@@ -695,6 +725,9 @@ func (e *Engine) actionable(r Rule, slot string) bool {
 		e.log.Info("action skipped: target slot is halted", "rule", r.Name, "slot", slot)
 		return false
 	}
+	if !e.trustEligible(r, slot) {
+		return false
+	}
 	if r.Then.Prompt == nil {
 		return true
 	}
@@ -706,6 +739,73 @@ func (e *Engine) actionable(r Rule, slot string) bool {
 	if !e.promptEligible(slot, status) {
 		e.log.Info("prompt skipped: target slot is not accepting prompts",
 			"rule", r.Name, "slot", slot, "status", status)
+		return false
+	}
+	return true
+}
+
+// trustEligible applies Config.Strict (PLAN §4.6).
+//
+// herdr derives some kinds' status by classifying the rendered screen, which
+// is an inference rather than an observation. Strict refuses to act on one.
+// As of herdr 0.8.0 that means a strict loop over Claude Code or Codex slots
+// will not fire — which is the honest consequence of the measurement, not a
+// defect here. Slots whose agents self-report (pi, opencode) are unaffected.
+//
+// A slot with no known tier is refused too: unknown provenance is not
+// evidence of structured provenance.
+func (e *Engine) trustEligible(r Rule, slot string) bool {
+	if !e.cfg.Strict {
+		return true
+	}
+	tier, ok := e.model.SlotTier(slot)
+	if !ok {
+		e.log.Warn("action refused: strict mode and the slot has no known detection tier",
+			"rule", r.Name, "slot", slot)
+		return false
+	}
+	if !tier.Trusted() {
+		e.log.Warn("action refused: strict mode and this slot's status is screen-classified, not self-reported",
+			"rule", r.Name, "slot", slot, "tier", string(tier))
+		return false
+	}
+	return true
+}
+
+// corroborate is the §4.9 check: an inferred status must be confirmed by
+// independent evidence before it drives an action.
+//
+// Re-reading the state model proves nothing — it returns the same inference
+// that is under suspicion. Asking herdr which processes hold the pane answers
+// a different question with different failure modes, so agreement between the
+// two is worth more than either alone. The specific lie this catches is the
+// one the ecosystem reports most: an agent that crashed or wedged leaving a
+// screen that still classifies as idle or done.
+//
+// Only applied where it can pay for itself: a self-reporting agent's status is
+// not an inference, and a probe failure is not treated as proof of death —
+// herdr may simply not be able to read the pane. Returning false halts the
+// action; the slot's next transition brings it back.
+func (e *Engine) corroborate(ctx context.Context, r Rule, slot string) bool {
+	tier, ok := e.model.SlotTier(slot)
+	if ok && tier.Trusted() {
+		return true // self-reported: not an inference, nothing to corroborate
+	}
+	target, ok := e.model.SlotTarget(slot)
+	if !ok {
+		return true // no pane yet — spawn paths have nothing to probe
+	}
+	info, err := e.client.PaneProcessInfo(ctx, target)
+	if err != nil {
+		// Inconclusive, not disproven. Log and proceed: refusing to act on a
+		// probe outage would stall every loop whenever herdr is busy.
+		e.log.Warn("corroboration probe failed; proceeding on the inferred status",
+			"rule", r.Name, "slot", slot, "err", err)
+		return true
+	}
+	if !info.HasForegroundProcess() {
+		e.log.Warn("action refused: pane holds no foreground process, so the inferred status is not corroborated",
+			"rule", r.Name, "slot", slot, "pane", target)
 		return false
 	}
 	return true
@@ -1138,6 +1238,12 @@ func (f *facts) resolve(field string) (string, bool) {
 		return string(f.status), true
 	case "kind":
 		return f.e.slots[f.slot].Kind, true
+	case "tier":
+		t, ok := f.e.model.SlotTier(f.slot)
+		if !ok {
+			return "", false
+		}
+		return string(t), true
 	case "iteration":
 		return strconv.Itoa(f.e.iterationCount()), true
 	}

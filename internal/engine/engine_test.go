@@ -13,6 +13,7 @@ import (
 	"time"
 
 	herdr "github.com/cyperx84/herdr-api"
+	"github.com/cyperx84/herdr-loop/internal/state"
 )
 
 // --- fakes -----------------------------------------------------------------
@@ -30,6 +31,10 @@ type fakeHerdr struct {
 	splits   []herdr.PaneSplitParams
 	starts   []herdr.AgentStartParams
 	notified []herdr.NotificationShowParams
+
+	processProbes []string
+	procGone      bool
+	procErr       error
 
 	promptErr error
 	startErr  error
@@ -111,6 +116,50 @@ type fakeModel struct {
 	status  map[string]herdr.AgentStatus
 	targets map[string]string
 	blocked map[string]string
+	tiers   map[string]state.Tier
+}
+
+// SlotTier defaults to TierScreen: the untrusted answer is the right default
+// for a fake, so a test that cares about trust has to say so explicitly and a
+// test that forgets cannot accidentally get the permissive path.
+func (m *fakeModel) SlotTier(slot string) (state.Tier, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t, ok := m.tiers[slot]; ok {
+		return t, true
+	}
+	if _, known := m.status[slot]; !known {
+		return "", false
+	}
+	return state.TierScreen, true
+}
+
+func (m *fakeModel) setTier(slot string, t state.Tier) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.tiers == nil {
+		m.tiers = map[string]state.Tier{}
+	}
+	m.tiers[slot] = t
+}
+
+// PaneProcessInfo answers the corroboration probe. Default is a live
+// foreground process, so existing tests keep their meaning; procGone makes a
+// pane look abandoned.
+func (f *fakeHerdr) PaneProcessInfo(_ context.Context, paneID string) (herdr.PaneProcessInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.processProbes = append(f.processProbes, paneID)
+	if f.procErr != nil {
+		return herdr.PaneProcessInfo{}, f.procErr
+	}
+	if f.procGone {
+		return herdr.PaneProcessInfo{PaneID: paneID}, nil
+	}
+	return herdr.PaneProcessInfo{
+		PaneID:              paneID,
+		ForegroundProcesses: []herdr.PaneProcessInfoProcess{{PID: 1, Name: "agent"}},
+	}, nil
 }
 
 func newModel() *fakeModel {
@@ -911,5 +960,97 @@ func writeFile(t *testing.T, path, contents string) {
 	}
 	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// PLAN §4.6: strict refuses to act on a status herdr inferred from the screen.
+// The consequence is deliberate and stated — as of herdr 0.8.0 a strict loop
+// over Claude Code slots does not fire at all.
+func TestStrictRefusesScreenClassifiedSlots(t *testing.T) {
+	client := &fakeHerdr{}
+	model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
+	model.setTier("review", state.TierScreen)
+
+	cfg := baseConfig(t)
+	cfg.Strict = true
+	e := newEngine(t, cfg, client, model)
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone, At: time.Now()})
+
+	if n := client.promptCount(); n != 0 {
+		t.Fatalf("strict fired %d prompt(s) against a screen-classified slot, want 0", n)
+	}
+}
+
+// The same loop must run once the slot's agent self-reports — strict excludes
+// heuristics, not the tool.
+func TestStrictPermitsStructuredSlots(t *testing.T) {
+	client := &fakeHerdr{}
+	model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
+	model.setTier("review", state.TierStructured)
+
+	cfg := baseConfig(t)
+	cfg.Strict = true
+	e := newEngine(t, cfg, client, model)
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone, At: time.Now()})
+
+	if n := client.promptCount(); n != 1 {
+		t.Fatalf("structured slot got %d prompt(s), want 1 — strict must permit self-reported status", n)
+	}
+}
+
+// PLAN §4.9: the most-reported failure in the ecosystem is a status that lies —
+// an agent crashed or wedged, leaving a screen that still classifies as idle.
+// An empty foreground process group is independent evidence against it.
+func TestCorroborationRefusesPaneWithNoForegroundProcess(t *testing.T) {
+	client := &fakeHerdr{procGone: true}
+	model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
+	model.setTier("review", state.TierScreen)
+
+	e := newEngine(t, baseConfig(t), client, model)
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone, At: time.Now()})
+
+	if n := client.promptCount(); n != 0 {
+		t.Fatalf("prompted a pane with no live process %d time(s), want 0", n)
+	}
+	client.mu.Lock()
+	probes := len(client.processProbes)
+	client.mu.Unlock()
+	if probes == 0 {
+		t.Error("no corroboration probe was issued — §4.9 requires independent evidence, not a model re-read")
+	}
+}
+
+// A self-reported status is not an inference, so it costs no probe.
+func TestCorroborationSkippedForStructuredSlots(t *testing.T) {
+	client := &fakeHerdr{procGone: true} // would refuse if probed
+	model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
+	model.setTier("review", state.TierStructured)
+
+	e := newEngine(t, baseConfig(t), client, model)
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone, At: time.Now()})
+
+	if n := client.promptCount(); n != 1 {
+		t.Fatalf("structured slot got %d prompt(s), want 1", n)
+	}
+	client.mu.Lock()
+	probes := len(client.processProbes)
+	client.mu.Unlock()
+	if probes != 0 {
+		t.Errorf("probed a self-reporting slot %d time(s) — its status is observed, not inferred", probes)
+	}
+}
+
+// A probe outage is inconclusive, not proof of death. Refusing to act on it
+// would stall every loop whenever herdr is momentarily busy.
+func TestCorroborationProbeFailureDoesNotBlockTheLoop(t *testing.T) {
+	client := &fakeHerdr{procErr: errors.New("herdr: busy")}
+	model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
+	model.setTier("review", state.TierScreen)
+
+	e := newEngine(t, baseConfig(t), client, model)
+	run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone, At: time.Now()})
+
+	if n := client.promptCount(); n != 1 {
+		t.Fatalf("a failed probe blocked the action (%d prompts, want 1) — inconclusive is not disproven", n)
 	}
 }
