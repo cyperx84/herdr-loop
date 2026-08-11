@@ -24,19 +24,37 @@ import (
 type nameIndex struct {
 	mu     sync.RWMutex
 	byName map[string]string // slot name -> pane id
+	// own is the set of slot names this loop declared. The index refuses any
+	// other name, however it is spelled in the session.
+	//
+	// Without this the index adopts every named agent herdr reports, and a
+	// session that already contains an agent called "impl" — a crashed run, a
+	// second herdr-loop, or a human who named one by hand — silently becomes
+	// this loop's slot. The loop would then prompt an agent it does not own,
+	// which is the cross-contamination one-owner-per-slot exists to prevent.
+	own map[string]bool
 }
 
-func newNameIndex() *nameIndex {
-	return &nameIndex{byName: make(map[string]string)}
+// newNameIndex builds an index restricted to the given slot names.
+func newNameIndex(slots []engine.SlotConfig) *nameIndex {
+	own := make(map[string]bool, len(slots))
+	for _, s := range slots {
+		own[s.Name] = true
+	}
+	return &nameIndex{byName: make(map[string]string), own: own}
 }
 
 // slots lists every slot name the index knows, sorted so progress output is
 // stable between reads rather than reordering on every map iteration.
+// slots lists every slot this loop declared, sorted, whether or not its agent
+// exists yet. Declared rather than discovered: a slot that has not spawned is
+// still part of the loop and must appear in progress output as pending, or a
+// watcher cannot tell "not started" from "not mine".
 func (n *nameIndex) slots() []string {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	out := make([]string, 0, len(n.byName))
-	for name := range n.byName {
+	out := make([]string, 0, len(n.own))
+	for name := range n.own {
 		out = append(out, name)
 	}
 	sort.Strings(out)
@@ -50,9 +68,23 @@ func (n *nameIndex) update(agents []herdr.Agent) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for _, a := range agents {
-		if a.Name != "" && a.PaneID != "" {
-			n.byName[a.Name] = a.PaneID
+		if a.Name == "" || a.PaneID == "" {
+			continue
 		}
+		if !n.own[a.Name] {
+			continue // another loop's agent, or a human's — not ours to drive
+		}
+		n.byName[a.Name] = a.PaneID
+	}
+}
+
+// set records a slot's pane directly, for a spawn that has just happened and
+// will not reach agent.list until the next reconcile.
+func (n *nameIndex) set(slot, paneID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.own[slot] {
+		n.byName[slot] = paneID
 	}
 }
 

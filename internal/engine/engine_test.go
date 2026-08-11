@@ -177,12 +177,23 @@ func (f *fakeHerdr) PaneProcessInfo(_ context.Context, paneID string) (herdr.Pan
 	if f.procGone {
 		return herdr.PaneProcessInfo{PaneID: paneID}, nil
 	}
+	shell := uint32(100)
 	if f.splitPanes[paneID] && !f.startedPanes[paneID] {
-		return herdr.PaneProcessInfo{PaneID: paneID}, nil // bare shell, ready
+		// A bare shell: herdr lists the shell itself, and the foreground
+		// process group is the shell's own pid.
+		return herdr.PaneProcessInfo{
+			PaneID:                   paneID,
+			ShellPID:                 &shell,
+			ForegroundProcessGroupID: &shell,
+			ForegroundProcesses:      []herdr.PaneProcessInfoProcess{{PID: 100, Name: "zsh"}},
+		}, nil
 	}
+	agent := uint32(222)
 	return herdr.PaneProcessInfo{
-		PaneID:              paneID,
-		ForegroundProcesses: []herdr.PaneProcessInfoProcess{{PID: 1, Name: "agent"}},
+		PaneID:                   paneID,
+		ShellPID:                 &shell,
+		ForegroundProcessGroupID: &agent,
+		ForegroundProcesses:      []herdr.PaneProcessInfoProcess{{PID: 222, Name: "agent"}},
 	}, nil
 }
 

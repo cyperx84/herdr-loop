@@ -111,7 +111,7 @@ func cmdRun(ctx context.Context, args []string) error {
 		reconcileEvery = state.DefaultReconcileInterval
 	}
 
-	idx := newNameIndex()
+	idx := newNameIndex(res.Config.Slots)
 	sm := state.New(teeingSnapshotter{client: client, idx: idx}, state.Options{ReconcileEvery: reconcileEvery})
 
 	bus, err := newEventBus(ctx, client)
@@ -125,6 +125,10 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 	log.Info("state model live", "reconciles", sm.Stats().Reconciles)
 
+	res.Config.OnSpawn = func(slot, paneID string) {
+		idx.set(slot, paneID)
+		log.Debug("slot mapped to pane", "slot", slot, "pane", paneID)
+	}
 	eng, err := engine.New(res.Config, client, modelAdapter{state: sm, idx: idx}, log)
 	if err != nil {
 		return fmt.Errorf("run: %w", err)
@@ -291,6 +295,12 @@ func feed(
 	defer ticker.Stop()
 
 	handle := func(tr state.Transition) {
+		// Every transition is logged before any decision about it. A
+		// supervisor that silently discards the signal it exists to act on is
+		// unfalsifiable from the outside — the failure mode this whole project
+		// is about (§4.9), applied to itself.
+		log.Debug("transition", "pane", tr.PaneID, "from", tr.From, "to", tr.To,
+			"source", tr.Source, "gone", tr.Gone, "settled", tr.BecameSettled())
 		if tr.Gone {
 			bus.unwatch(tr.PaneID)
 		}
@@ -336,7 +346,7 @@ func feed(
 				delete(initialPrompts, slot)
 				go func() {
 					defer lk.Unlock()
-					deliverInitialPrompt(ctx, client, tr.PaneID, slot, text, log)
+					deliverInitialPrompt(ctx, eng, tr.PaneID, slot, text, log)
 				}()
 				return
 			}
@@ -385,8 +395,11 @@ func feed(
 // deliverInitialPrompt sends a slot's [[slot]].prompt exactly once, the
 // first time that slot settles after being spawned. See feed's handle
 // closure for why this bypasses the rule engine entirely.
-func deliverInitialPrompt(ctx context.Context, client *herdr.Client, target, slot, text string, log *slog.Logger) {
-	if _, err := client.AgentPrompt(ctx, target, text, nil); err != nil {
+func deliverInitialPrompt(ctx context.Context, eng *engine.Engine, target, slot, text string, log *slog.Logger) {
+	// Through the engine, not the client directly: a just-spawned agent is
+	// not addressable for a moment after it first reports idle, and this is
+	// the prompt that always lands in that window.
+	if err := eng.SendPrompt(ctx, target, text); err != nil {
 		log.Error("initial prompt failed", "slot", slot, "err", err)
 		return
 	}

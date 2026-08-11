@@ -269,6 +269,17 @@ type Config struct {
 	// entirely. Turn it on for loops where acting on a wrong "done" is worse
 	// than not acting at all.
 	Strict bool
+	// OnSpawn is called with a slot's name and the pane its agent was just
+	// started in, before that fact could reach any reconcile.
+	//
+	// It exists because the alternative loses the agent's arrival: the first
+	// transition lands within a second of the start, while a reconcile is
+	// tens of seconds away, so a supervisor that learns the slot-to-pane
+	// mapping only from agent.list drops the settled transition it was
+	// waiting for and then waits forever, because a settled agent produces no
+	// further events. Optional; nil is fine for callers that do not map panes
+	// back to slots.
+	OnSpawn func(slot, paneID string)
 	// RunCWD is where run actions execute when they name no directory of
 	// their own. Empty means the supervisor's working directory.
 	//
@@ -882,8 +893,12 @@ func (e *Engine) corroborate(ctx context.Context, r Rule, slot string) bool {
 			"rule", r.Name, "slot", slot, "err", err)
 		return true
 	}
-	if !info.HasForegroundProcess() {
-		e.log.Warn("action refused: pane holds no foreground process, so the inferred status is not corroborated",
+	// A pane whose agent exited falls back to its shell, and the shell is
+	// itself a foreground process — so "has any foreground process" stays true
+	// for a dead agent and corroborates nothing. The real question is whether
+	// something other than the bare shell is running.
+	if !info.RunsForegroundCommand() {
+		e.log.Warn("action refused: pane has fallen back to its shell, so the agent is gone and the inferred status is stale",
 			"rule", r.Name, "slot", slot, "pane", target)
 		return false
 	}
@@ -954,7 +969,7 @@ func (e *Engine) prompt(ctx context.Context, slot, text string) error {
 	// fold synchronous with an agent's turn; the settle is observed as the
 	// next transition instead, which is the whole point of an event-driven
 	// engine.
-	if _, err := e.client.AgentPrompt(ctx, target, text, nil); err != nil {
+	if err := e.sendPrompt(ctx, target, text); err != nil {
 		if herdr.IsAgentPromptStalled(err) {
 			// herdr could not observe a lifecycle change within 5s of
 			// delivery — it does not know the prompt was received. Surfacing
@@ -965,6 +980,86 @@ func (e *Engine) prompt(ctx context.Context, slot, text string) error {
 		return fmt.Errorf("engine: agent.prompt %s: %w", slot, err)
 	}
 	return nil
+}
+
+// SendPrompt delivers a prompt to an agent target, retrying while herdr
+// reports it is not yet addressable.
+//
+// Exported for the supervisor's bootstrap path: a slot's first prompt is
+// delivered outside the rule engine, but it hits the same not-yet-registered
+// window and must handle it the same way.
+func (e *Engine) SendPrompt(ctx context.Context, target, text string) error {
+	return e.sendPrompt(ctx, target, text)
+}
+
+// AgentReadyTimeout bounds the wait for a just-started agent to become
+// addressable by name.
+const AgentReadyTimeout = 30 * time.Second
+
+// PromptDeliveryTimeout bounds the confirmation that a prompt actually
+// started an agent working. Short: this confirms delivery, it does not wait
+// for the answer.
+const PromptDeliveryTimeout = 15 * time.Second
+
+func promptDeliveryTimeoutMs() *uint64 {
+	ms := uint64(PromptDeliveryTimeout / time.Millisecond)
+	return &ms
+}
+
+// sendPrompt delivers a prompt, retrying while herdr reports the agent is not
+// yet an active named agent.
+//
+// herdr has a window in which an agent already reports idle but is not yet
+// addressable: agent.start returns a launch-pending seat, and the first status
+// event arrives before registration completes. Prompting inside that window
+// fails agent_not_ready — reliably, on the very first prompt of every run,
+// since that is exactly when the loop reacts to the agent settling.
+//
+// Retrying is the honest fix rather than sleeping a guessed interval: the
+// server knows when it is ready and says so, and only that one error code is
+// retried. Everything else, agent_prompt_stalled included, returns at once —
+// a stall means delivery is unconfirmed, which is a report to make, not a
+// condition to wait out.
+func (e *Engine) sendPrompt(ctx context.Context, target, text string) error {
+	deadline := time.Now().Add(AgentReadyTimeout)
+	for attempt := 1; ; attempt++ {
+		// A wait is requested, but only far enough to confirm delivery — not
+		// to sit through the agent's turn.
+		//
+		// Passing nil looks right for an event-driven engine and is a trap:
+		// herdr only runs its delivery check when a wait is asked for, so
+		// agent.prompt returns success whether or not the text ever reached
+		// the agent. Observed end to end — a prompt reported delivered, the
+		// agent stayed idle, and the loop waited forever on a turn that never
+		// began. That is the status-lie failure (§4.9) reaching the one
+		// operation the whole loop depends on.
+		//
+		// until=working with a short timeout asks herdr to confirm the agent
+		// actually started, then returns; the completion is still observed as
+		// the next transition, which is what keeps the fold asynchronous.
+		_, err := e.client.AgentPrompt(ctx, target, text, &herdr.AgentPromptWaitOptions{
+			Until:     []herdr.AgentStatus{herdr.StatusWorking},
+			TimeoutMs: promptDeliveryTimeoutMs(),
+		})
+		if err == nil {
+			if attempt > 1 {
+				e.log.Debug("prompt delivered after retry", "target", target, "attempts", attempt)
+			}
+			return nil
+		}
+		var apiErr *herdr.APIError
+		if !errors.As(err, &apiErr) || apiErr.Code != "agent_not_ready" {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("agent %s never became addressable within %s: %w", target, AgentReadyTimeout, err)
+		}
+		select {
+		case <-time.After(300 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // Spawn brings a slot up: a pane carrying HERDR_LOOP_HANDOFF, then an agent in
@@ -1011,18 +1106,63 @@ func (e *Engine) Spawn(ctx context.Context, slot string) error {
 	if err := e.waitForShell(ctx, pane.ID); err != nil {
 		return fmt.Errorf("engine: %s: %w", slot, err)
 	}
-	if _, err := e.client.AgentStart(ctx, herdr.AgentStartParams{
-		PaneID: pane.ID,
-		Name:   slot,
-		Kind:   sc.Kind,
-		Args:   sc.Args,
-	}); err != nil {
-		return fmt.Errorf("engine: agent.start %s: %w", slot, err)
+	if err := e.startAgent(ctx, slot, sc, pane.ID); err != nil {
+		return err
+	}
+	// Publish the mapping before returning, so a transition arriving in the
+	// next moment can be attributed to this slot.
+	if e.cfg.OnSpawn != nil {
+		e.cfg.OnSpawn(slot, pane.ID)
 	}
 	release = false
 	e.log.Info("slot spawned", "slot", slot, "kind", sc.Kind, "pane", pane.ID,
 		HandoffEnv, e.HandoffPath(slot))
 	return nil
+}
+
+// startAgent starts a slot's agent, retrying while herdr reports the pane is
+// not yet an available shell.
+//
+// waitForShell narrows the window but cannot close it: it asks the kernel
+// which process group holds the terminal, while herdr applies its own
+// readiness test, and a shell can satisfy the first before the second. The
+// result is a race that shows up as agent_pane_busy on a pane that looked
+// ready — observed intermittently against herdr 0.8.0, succeeding and failing
+// across otherwise identical runs.
+//
+// So the server is treated as the authority rather than predicted: ask, and
+// retry while it says not yet. Only agent_pane_busy is retried — every other
+// error is real and returned immediately, because retrying a missing binary or
+// a bad kind just delays the report.
+func (e *Engine) startAgent(ctx context.Context, slot string, sc SlotConfig, paneID string) error {
+	deadline := time.Now().Add(ShellReadyTimeout)
+	for attempt := 1; ; attempt++ {
+		_, err := e.client.AgentStart(ctx, herdr.AgentStartParams{
+			PaneID: paneID,
+			Name:   slot,
+			Kind:   sc.Kind,
+			Args:   sc.Args,
+		})
+		if err == nil {
+			if attempt > 1 {
+				e.log.Debug("agent started after retry", "slot", slot, "attempts", attempt)
+			}
+			return nil
+		}
+		var apiErr *herdr.APIError
+		if !errors.As(err, &apiErr) || apiErr.Code != "agent_pane_busy" {
+			return fmt.Errorf("engine: agent.start %s: %w", slot, err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("engine: agent.start %s: pane %s never became an available shell within %s: %w",
+				slot, paneID, ShellReadyTimeout, err)
+		}
+		select {
+		case <-time.After(250 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // ShellReadyTimeout bounds the wait for a freshly split pane's shell to reach
@@ -1051,7 +1191,10 @@ func (e *Engine) waitForShell(ctx context.Context, paneID string) error {
 				"pane", paneID, "err", err)
 			return nil
 		}
-		if !info.HasForegroundProcess() {
+		// The shell holding the foreground IS the available-shell condition.
+		// Not "no foreground process": herdr lists the shell itself among
+		// them, so that check never becomes true and every spawn times out.
+		if info.ShellHoldsForeground() {
 			if attempt > 0 {
 				e.log.Debug("pane shell ready", "pane", paneID, "attempts", attempt+1)
 			}

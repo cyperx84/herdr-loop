@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	herdr "github.com/cyperx84/herdr-api"
+	"github.com/cyperx84/herdr-loop/internal/engine"
 	"github.com/cyperx84/herdr-loop/internal/state"
 )
 
@@ -47,7 +48,7 @@ func TestModelAdapterResolvesSlotByName(t *testing.T) {
 		{Name: "review", Agent: strPtr("codex"), PaneID: "w1:p2", Status: herdr.StatusWorking},
 	}
 
-	idx := newNameIndex()
+	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}, {Name: "review"}, {Name: "a"}, {Name: "b"}})
 	sm := state.New(teeingFake{fakeSnapshotter{agents}, idx}, state.Options{})
 
 	// Reconcile needs two passes to go live on a non-empty session (adopt,
@@ -93,7 +94,7 @@ func TestModelAdapterResolvesSlotByName(t *testing.T) {
 // an approval prompt's literal text, so this must always report "no match"
 // rather than ever synthesizing consent.
 func TestModelAdapterBlockedPromptAlwaysUnmatched(t *testing.T) {
-	a := modelAdapter{state: state.New(fakeSnapshotter{}, state.Options{}), idx: newNameIndex()}
+	a := modelAdapter{state: state.New(fakeSnapshotter{}, state.Options{}), idx: newNameIndex(nil)}
 	if _, ok := a.BlockedPrompt("anything"); ok {
 		t.Error("BlockedPrompt reported ok=true, want false always")
 	}
@@ -102,7 +103,7 @@ func TestModelAdapterBlockedPromptAlwaysUnmatched(t *testing.T) {
 // TestNameIndexReverseLookup covers slotFor, the direction feed() uses to
 // turn a pane-keyed state.Transition back into a slot-keyed engine.Transition.
 func TestNameIndexReverseLookup(t *testing.T) {
-	idx := newNameIndex()
+	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}, {Name: "review"}, {Name: "a"}, {Name: "b"}})
 	idx.update([]herdr.Agent{
 		{Name: "impl", PaneID: "w1:p1"},
 		{Name: "review", PaneID: "w1:p2"},
@@ -114,5 +115,56 @@ func TestNameIndexReverseLookup(t *testing.T) {
 	}
 	if _, ok := idx.slotFor("w9:p9"); ok {
 		t.Error("slotFor(unknown pane) reported ok=true, want false")
+	}
+}
+
+// Found on the first real run: the index adopted every named agent in the
+// session, so a loop's status showed other people's agents — and, far worse,
+// an agent that happened to share a slot's name would have been driven as if
+// it were ours. A session routinely contains agents from other work.
+func TestNameIndexIgnoresAgentsThisLoopDoesNotOwn(t *testing.T) {
+	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}, {Name: "review"}})
+
+	idx.update([]herdr.Agent{
+		{Name: "impl", PaneID: "w1:p1"},     // ours
+		{Name: "shaderfx", PaneID: "w9:p9"}, // somebody else's work
+		{Name: "heromain", PaneID: "w9:p8"}, // ditto
+	})
+
+	if pane, ok := idx.paneFor("impl"); !ok || pane != "w1:p1" {
+		t.Errorf("own slot not indexed: pane=%q ok=%v", pane, ok)
+	}
+	if _, ok := idx.paneFor("shaderfx"); ok {
+		t.Error("adopted an agent this loop never declared — it would be prompted as if it were ours")
+	}
+	if slot, ok := idx.slotFor("w9:p9"); ok {
+		t.Errorf("foreign pane w9:p9 resolved to slot %q; a rule firing on it would drive another loop's agent", slot)
+	}
+
+	// Declared-but-unspawned slots must still be listed, or a watcher cannot
+	// tell "not started yet" from "not part of this loop".
+	got := idx.slots()
+	if len(got) != 2 || got[0] != "impl" || got[1] != "review" {
+		t.Errorf("slots() = %v, want both declared slots including the unspawned one", got)
+	}
+}
+
+// The specific collision the reviewer predicted: a leftover agent from a
+// crashed run, carrying the same name, in a different pane.
+func TestNameIndexDoesNotAdoptStaleAgentInAnotherPane(t *testing.T) {
+	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}})
+
+	// Our spawn lands first.
+	idx.update([]herdr.Agent{{Name: "impl", PaneID: "w1:p1"}})
+	if pane, _ := idx.paneFor("impl"); pane != "w1:p1" {
+		t.Fatalf("setup: pane=%q", pane)
+	}
+	// A later reconcile also sees an agent named impl that is not ours. The
+	// name is ours, so it is accepted — this documents the remaining limit:
+	// herdr names are unique among live agents, so two live "impl" agents
+	// cannot coexist, and the index tracks whichever herdr currently reports.
+	idx.update([]herdr.Agent{{Name: "impl", PaneID: "w2:p2"}})
+	if pane, _ := idx.paneFor("impl"); pane != "w2:p2" {
+		t.Errorf("index did not follow the live agent: pane=%q", pane)
 	}
 }
