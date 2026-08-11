@@ -917,6 +917,15 @@ func (e *Engine) Spawn(ctx context.Context, slot string) error {
 	if err != nil {
 		return fmt.Errorf("engine: pane.split %s: %w", slot, err)
 	}
+	// A freshly split pane is not immediately an available shell: its shell
+	// is still starting, and agent.start requires the shell itself to be in
+	// the foreground at an interactive prompt. Calling straight through
+	// fails with agent_pane_busy — observed against herdr 0.8.0, not
+	// theorised, and it is the ordinary case rather than a race that
+	// sometimes bites.
+	if err := e.waitForShell(ctx, pane.ID); err != nil {
+		return fmt.Errorf("engine: %s: %w", slot, err)
+	}
 	if _, err := e.client.AgentStart(ctx, herdr.AgentStartParams{
 		PaneID: pane.ID,
 		Name:   slot,
@@ -929,6 +938,50 @@ func (e *Engine) Spawn(ctx context.Context, slot string) error {
 	e.log.Info("slot spawned", "slot", slot, "kind", sc.Kind, "pane", pane.ID,
 		HandoffEnv, e.HandoffPath(slot))
 	return nil
+}
+
+// ShellReadyTimeout bounds the wait for a freshly split pane's shell to reach
+// its prompt. Generous: a cold shell with a heavy rc file is slow, and the
+// cost of waiting too long is a slower spawn, while the cost of not waiting
+// long enough is a failed run.
+const ShellReadyTimeout = 15 * time.Second
+
+// waitForShell blocks until a pane is an available shell, or the timeout
+// expires.
+//
+// "Available" means the shell itself holds the foreground — no command,
+// editor, or agent running — which is what agent.start requires. An empty
+// foreground process list is exactly that condition, so pane.process_info
+// answers the question directly rather than by guessing at a fixed sleep.
+//
+// A probe error is not fatal: if herdr cannot tell us, fall through and let
+// agent.start be the authority. Its own error is clearer than one invented
+// here.
+func (e *Engine) waitForShell(ctx context.Context, paneID string) error {
+	deadline := time.Now().Add(ShellReadyTimeout)
+	for attempt := 0; ; attempt++ {
+		info, err := e.client.PaneProcessInfo(ctx, paneID)
+		if err != nil {
+			e.log.Debug("shell readiness probe failed; proceeding to agent.start",
+				"pane", paneID, "err", err)
+			return nil
+		}
+		if !info.HasForegroundProcess() {
+			if attempt > 0 {
+				e.log.Debug("pane shell ready", "pane", paneID, "attempts", attempt+1)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("pane %s never reached an interactive shell prompt within %s (foreground process %q still running)",
+				paneID, ShellReadyTimeout, info.ForegroundProcesses[0].Name)
+		}
+		select {
+		case <-time.After(150 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // Release gives a slot's concurrency token back. Callers tearing a slot down

@@ -851,11 +851,23 @@ the old behaviour.
    destroy uncommitted work yet. The invariant must be built *with* the first teardown
    path, not after it — the prior-art incident it comes from was exactly that ordering
    mistake.
-3. **No live `pane_agent_status_changed` observed end to end.** Decoders are
-   contract-tested against real captured frames, but the wire path for the one signal the
-   engine gates on is unproven against a running agent. Closing it means spawning an
-   agent: use `opencode`, which self-reports (§4.6) and runs keyless, rather than an
-   OAuth-authenticated kind.
+3. ~~**No live `pane_agent_status_changed` observed end to end.**~~ **CLOSED, and it
+   found a bug that would have stopped the engine ever working.** Driving a real
+   `opencode` agent through idle → working → done revealed that the server spells the
+   same event two ways: a *global* subscription delivers the underscored
+   `pane_agent_detected` from the schema's `EventKind`, while a *per-pane* subscription
+   echoes back the dotted subscription type — `pane.agent_status_changed`, which appears
+   nowhere in the schema and carries no `type` field. Filtering on the documented
+   spelling, which both this plugin and herdr-api did, silently discarded every status
+   event while global events kept arriving: the stream looked healthy, the drop counters
+   read zero, and no rule could ever fire. Now normalized at the herdr-api boundary and
+   pinned by tests in both repos.
+
+   Two smaller findings from the same session, both also fixed: a freshly split pane is
+   not an available shell, so `agent.start` against one fails `agent_pane_busy` —
+   `Spawn` now waits for the shell to reach its prompt using `pane.process_info`. And
+   `agent.start` returns a launch-pending seat rather than blocking until the agent is
+   interactive, so callers must poll rather than assume.
 4. **`strict` is honest but currently near-unusable.** As of herdr 0.8.0 only `pi` and
    `opencode` self-report, so a strict loop over Claude Code or Codex slots will not fire
    at all. The right fix is upstream — contributing structured status reporting to those

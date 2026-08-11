@@ -587,3 +587,49 @@ func TestBusySessionGoesLiveOnMaxWaitAndSaysLivenessWasAssumed(t *testing.T) {
 		t.Error("LivenessProven = true, but the stream never fell quiet — this must report an assumption, not a proof")
 	}
 }
+
+// The wire delivers per-pane status events under a dotted name the schema does
+// not list. herdr-api normalizes it, but the model is where the cost of a
+// mismatch lands, so pin the contract here too: this frame must produce a
+// transition, not be silently ignored.
+func TestNormalizedPerPaneStatusFrameIsFolded(t *testing.T) {
+	clk := newClock()
+	src := &fakeAgents{list: []herdr.Agent{agent("w1:p5", "opencode", herdr.StatusIdle, true)}}
+	m := New(src, Options{Now: clk.now})
+
+	// Drain replay and reach live.
+	for i := 0; i < 4 && !m.IsLive(); i++ {
+		clk.advance(DefaultReconcileInterval)
+		if _, err := m.Reconcile(ctxb()); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+	if !m.IsLive() {
+		t.Fatal("model never went live")
+	}
+
+	before := m.Stats().EventsIgnored
+
+	// idle -> working -> done, the real cycle a prompt drives. Only the second
+	// leg "becomes" settled: idle was already settled, so a transition out of
+	// it is not a completion signal.
+	if _, ok := m.Apply(statusEvent("w1:p5", "opencode", herdr.StatusWorking)); !ok {
+		t.Fatal("working transition was not actionable — the event kind was not recognised")
+	}
+	tr, ok := m.Apply(statusEvent("w1:p5", "opencode", herdr.StatusDone))
+	if !ok {
+		t.Fatal("a live status change produced no actionable transition — the kind was not recognised")
+	}
+	if tr.From != herdr.StatusWorking || tr.To != herdr.StatusDone {
+		t.Errorf("transition = %+v, want working -> done", tr)
+	}
+	if !tr.BecameSettled() {
+		t.Error("working -> done did not report BecameSettled; this is the edge that releases the next rule")
+	}
+	if tr.Tier != TierStructured {
+		t.Errorf("tier = %q, want structured — opencode self-reports", tr.Tier)
+	}
+	if got := m.Stats().EventsIgnored; got != before {
+		t.Errorf("EventsIgnored rose to %d — the frame was dropped rather than folded", got)
+	}
+}

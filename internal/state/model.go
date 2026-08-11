@@ -354,6 +354,13 @@ func (m *Model) Apply(ev herdr.Event) (Transition, bool) {
 		}
 		return m.applyPane(d.Pane)
 
+	// herdr-api normalizes the wire spelling: a per-pane subscription
+	// actually delivers "pane.agent_status_changed" (dotted, absent from the
+	// schema's EventKind), while global subscriptions use this underscored
+	// form. Matching only the documented spelling here silently discarded
+	// every status event — the one signal the rule engine gates on — while
+	// global events kept flowing, so the stream looked healthy and nothing
+	// fired. Verified fixed by driving a live opencode agent.
 	case "pane_agent_status_changed":
 		var d herdr.AgentStatusChanged
 		if !m.decode(ev, &d) {

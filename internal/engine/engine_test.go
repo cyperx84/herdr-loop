@@ -35,6 +35,8 @@ type fakeHerdr struct {
 	processProbes []string
 	procGone      bool
 	procErr       error
+	splitPanes    map[string]bool
+	startedPanes  map[string]bool
 
 	promptErr error
 	startErr  error
@@ -66,6 +68,10 @@ func (f *fakeHerdr) AgentSendKeys(_ context.Context, target string, keys []strin
 func (f *fakeHerdr) AgentStart(_ context.Context, p herdr.AgentStartParams) (herdr.AgentStartResult, error) {
 	f.mu.Lock()
 	f.starts = append(f.starts, p)
+	if f.startedPanes == nil {
+		f.startedPanes = map[string]bool{}
+	}
+	f.startedPanes[p.PaneID] = true
 	f.mu.Unlock()
 	return herdr.AgentStartResult{Agent: herdr.Agent{PaneID: p.PaneID}}, f.startErr
 }
@@ -75,11 +81,16 @@ func (f *fakeHerdr) PaneSplit(_ context.Context, p herdr.PaneSplitParams) (herdr
 	f.splits = append(f.splits, p)
 	n := len(f.splits)
 	hook := f.onSplit
+	id := "pane-" + string(rune('0'+n))
+	if f.splitPanes == nil {
+		f.splitPanes = map[string]bool{}
+	}
+	f.splitPanes[id] = true
 	f.mu.Unlock()
 	if hook != nil {
 		hook()
 	}
-	return herdr.Pane{ID: "pane-" + string(rune('0'+n))}, nil
+	return herdr.Pane{ID: id}, nil
 }
 
 func (f *fakeHerdr) NotificationShow(_ context.Context, p herdr.NotificationShowParams) (herdr.NotificationShowResult, error) {
@@ -146,6 +157,16 @@ func (m *fakeModel) setTier(slot string, t state.Tier) {
 // PaneProcessInfo answers the corroboration probe. Default is a live
 // foreground process, so existing tests keep their meaning; procGone makes a
 // pane look abandoned.
+// PaneProcessInfo models what a real pane reports, because two different
+// checks read it and they need opposite answers:
+//
+//   - Spawn's shell-readiness wait: a freshly split pane is a bare shell, so
+//     it must report NO foreground process or agent.start is called too early.
+//   - The §4.9 corroboration probe: a pane running an agent must report one,
+//     or every action is refused as uncorroborated.
+//
+// So the fake tracks which panes it has started an agent in. procGone forces
+// the empty answer regardless, for tests about a dead agent.
 func (f *fakeHerdr) PaneProcessInfo(_ context.Context, paneID string) (herdr.PaneProcessInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -155,6 +176,9 @@ func (f *fakeHerdr) PaneProcessInfo(_ context.Context, paneID string) (herdr.Pan
 	}
 	if f.procGone {
 		return herdr.PaneProcessInfo{PaneID: paneID}, nil
+	}
+	if f.splitPanes[paneID] && !f.startedPanes[paneID] {
+		return herdr.PaneProcessInfo{PaneID: paneID}, nil // bare shell, ready
 	}
 	return herdr.PaneProcessInfo{
 		PaneID:              paneID,
@@ -1052,5 +1076,58 @@ func TestCorroborationProbeFailureDoesNotBlockTheLoop(t *testing.T) {
 
 	if n := client.promptCount(); n != 1 {
 		t.Fatalf("a failed probe blocked the action (%d prompts, want 1) — inconclusive is not disproven", n)
+	}
+}
+
+// Found by driving a real herdr, not by reading code: a freshly split pane is
+// not immediately an available shell, and agent.start against one fails with
+// agent_pane_busy. Spawn must wait for the shell to reach its prompt.
+func TestSpawnWaitsForShellBeforeStartingAgent(t *testing.T) {
+	client := &fakeHerdr{}
+	model := newModel()
+	e := newEngine(t, baseConfig(t), client, model)
+
+	if err := e.Spawn(context.Background(), "impl"); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	client.mu.Lock()
+	probes := append([]string(nil), client.processProbes...)
+	starts := len(client.starts)
+	client.mu.Unlock()
+
+	if starts != 1 {
+		t.Fatalf("agent.start calls = %d, want 1", starts)
+	}
+	if len(probes) == 0 {
+		t.Fatal("no readiness probe before agent.start — this is the agent_pane_busy failure observed against herdr 0.8.0")
+	}
+}
+
+// A pane whose shell never reaches a prompt must fail with a message naming
+// what is holding it, not hang and not fail obscurely inside agent.start.
+func TestSpawnFailsClearlyWhenShellNeverBecomesAvailable(t *testing.T) {
+	client := &fakeHerdr{}
+	model := newModel()
+	e := newEngine(t, baseConfig(t), client, model)
+
+	// Mark the pane as already running something, so it never looks like a
+	// bare shell.
+	client.mu.Lock()
+	client.startedPanes = map[string]bool{"pane-1": true}
+	client.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := e.Spawn(ctx, "impl")
+	if err == nil {
+		t.Fatal("Spawn succeeded against a pane that never became an available shell")
+	}
+	client.mu.Lock()
+	starts := len(client.starts)
+	client.mu.Unlock()
+	if starts != 0 {
+		t.Errorf("agent.start was called %d time(s) despite the shell never being ready", starts)
 	}
 }
