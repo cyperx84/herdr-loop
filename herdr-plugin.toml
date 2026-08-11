@@ -72,7 +72,10 @@ id = "board"
 title = "herdr-loop"
 placement = "split"
 direction = "down"
-height = "30%"
+# No width/height here: herdr rejects the whole plugin at install time with
+# "pane width and height are only supported when placement is popup". A split
+# pane takes its size from the split, and the schema's PopupSize fields apply
+# to popups alone — found by installing, not by reading.
 command = ["./bin/herdr-loop", "run"]
 
 # Reaches the process as HERDR_LOOP_DEFAULT_MANIFEST / HERDR_LOOP_KINDS_FILE /
