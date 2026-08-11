@@ -121,8 +121,6 @@ func validateGraph(path string, data []byte) error {
 	}
 	fmt.Printf("%s: OK — graph, %d node(s) (%d loop, %d slot), %d edge(s), entry %q\n",
 		path, len(g.Nodes), loops, slots, len(g.Edges), g.Entry)
-	// Say what does not happen yet, so nobody reads OK as "this will run".
-	fmt.Printf("  note: graphs validate and sequence today; executing a node's\n")
-	fmt.Printf("        nested loop is not implemented yet.\n")
+	fmt.Printf("  run it: herdr-loop graph %s\n", path)
 	return nil
 }

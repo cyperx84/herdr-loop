@@ -528,3 +528,83 @@ func (r *Run) Next(name string) ([]Edge, error) {
 	}
 	return out, nil
 }
+
+// Node returns a node by name.
+func (g *Graph) Node(name string) (Node, bool) {
+	for _, n := range g.Nodes {
+		if n.Name == name {
+			return n, true
+		}
+	}
+	return Node{}, false
+}
+
+// HoldsForOutcome evaluates an edge predicate against the outcome a node's
+// loop reported.
+//
+// The grammar is the loop's own — all/any/not/eq/in/exists — so anyone who has
+// written a rule already knows how to write an edge. What differs is the
+// vocabulary: at rule altitude a predicate reads a slot's live status, while
+// here the node has already finished and the only fact worth branching on is
+// how it ended. "outcome" is therefore the field an edge reads, and it holds
+// engine.Outcome.Reason verbatim: "converged", "loop:budget-exhausted", or
+// whatever a finish action named.
+//
+// An unknown field is false rather than an error. An edge that cannot be
+// evaluated must not be taken, and a graph that refused to run because one
+// edge mentioned a field this altitude does not expose would be worse than one
+// that simply does not follow it — the failure is visible either way, in the
+// summary, as a node that never activated.
+func HoldsForOutcome(p Predicate, outcome string) bool {
+	switch p.Op {
+	case "all":
+		for _, sub := range p.Filters {
+			if !HoldsForOutcome(sub, outcome) {
+				return false
+			}
+		}
+		return true
+	case "any":
+		for _, sub := range p.Filters {
+			if HoldsForOutcome(sub, outcome) {
+				return true
+			}
+		}
+		return false
+	case "not":
+		if p.Filter == nil {
+			return false
+		}
+		return !HoldsForOutcome(*p.Filter, outcome)
+	case "eq":
+		v, ok := outcomeField(p.Field, outcome)
+		return ok && fmt.Sprint(p.Value) == v
+	case "in":
+		v, ok := outcomeField(p.Field, outcome)
+		if !ok {
+			return false
+		}
+		for _, want := range p.Values {
+			if fmt.Sprint(want) == v {
+				return true
+			}
+		}
+		return false
+	case "exists":
+		_, ok := outcomeField(p.Field, outcome)
+		return ok
+	}
+	return false
+}
+
+// outcomeField resolves the fields an edge may read about a finished node.
+func outcomeField(field, outcome string) (string, bool) {
+	switch field {
+	case "outcome", "reason":
+		// "reason" is accepted because engine.Outcome calls it that, and
+		// somebody reading the loop's own logs will reach for the word they
+		// saw there.
+		return outcome, outcome != ""
+	}
+	return "", false
+}

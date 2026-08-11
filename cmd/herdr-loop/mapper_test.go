@@ -308,3 +308,55 @@ func TestConvertBlockedRuleSplitsKeys(t *testing.T) {
 		}
 	}
 }
+
+// Only a worktree this run created may ever be torn down.
+//
+// A slot given a bare cwd in the manifest points at the user's own repo. If
+// that were marked as ours, `--teardown` would delete the directory someone
+// was working in — the worst possible outcome from a convenience flag. The
+// flag is set on exactly one path (resolveWorktrees, after worktree.create)
+// and this pins the other half: mapping alone never sets it.
+func TestMappedSlotsAreNotMarkedAsOursToRemove(t *testing.T) {
+	const src = `
+[loop]
+name = "t"
+max_iterations = 3
+
+[[slot]]
+name = "mine"
+kind = "opencode"
+cwd  = "/Users/someone/real-repo"
+
+[[slot]]
+name = "generated"
+kind = "opencode"
+worktree = { branch = "loop/generated" }
+`
+	m, err := manifest.Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	res, err := mapManifest(m)
+	if err != nil {
+		t.Fatalf("mapManifest: %v", err)
+	}
+
+	for _, sc := range res.Config.Slots {
+		if sc.Worktree {
+			t.Errorf("slot %q was marked as a worktree this run owns, before any worktree was created", sc.Name)
+		}
+	}
+
+	// The worktree slot is recorded as needing one, which is what
+	// resolveWorktrees later acts on — that is where ownership is claimed.
+	if len(res.Worktrees) != 1 {
+		t.Fatalf("worktree requests = %d, want 1", len(res.Worktrees))
+	}
+	if got := res.Config.Slots[res.Worktrees[0].SlotIndex].Name; got != "generated" {
+		t.Errorf("worktree request points at slot %q, want generated", got)
+	}
+	// And the slot with a literal cwd keeps it untouched.
+	if res.Config.Slots[0].CWD != "/Users/someone/real-repo" {
+		t.Errorf("literal cwd was rewritten to %q", res.Config.Slots[0].CWD)
+	}
+}

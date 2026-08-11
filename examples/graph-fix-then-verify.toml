@@ -1,0 +1,37 @@
+# A graph of loops — VERIFIED END TO END on herdr 0.8.0.
+#
+# Each node is a whole loop. The edge decides which loop runs next, based on
+# how the previous one ended.
+#
+# Recorded run:
+#   fix     spawned pi, the agent fixed a real bug, the `go test` gate passed
+#           -> settled "converged"
+#   edge    outcome == "converged" held -> activate verify
+#   verify  spawned pi, the `go vet` gate passed
+#           -> settled "clean"
+#   2 activations of a budget of 6
+#
+# The node manifests are ordinary loop.toml files — nothing about them knows
+# it is running inside a graph, which is the point: a plain loop is a graph
+# with one node, so every existing manifest composes without being rewritten.
+#
+# Run it:  herdr-loop graph --kinds kinds.toml graph.toml
+
+[graph]
+name           = "fix-then-verify"
+entry          = "fix"
+max_iterations = 6
+
+[[node]]
+name = "fix"
+loop = "fix.toml"
+
+[[node]]
+name = "verify"
+loop = "verify.toml"
+
+# Only run the verify loop if the fix loop actually converged.
+[[edge]]
+from = "fix"
+when = { op = "eq", field = "outcome", value = "converged" }
+then = { activate = "verify" }

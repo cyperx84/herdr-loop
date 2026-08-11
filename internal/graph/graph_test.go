@@ -477,3 +477,54 @@ func mustSettle(t *testing.T, r *Run, name, reason string) {
 		t.Fatalf("Settle(%s): %v", name, err)
 	}
 }
+
+// Edges branch on how a node's loop ended. Same grammar as a rule, different
+// vocabulary: a finished node has no live status, only an outcome.
+func TestHoldsForOutcome(t *testing.T) {
+	eq := func(field, want string) Predicate {
+		return Predicate{Op: "eq", Field: field, Value: want}
+	}
+
+	if !HoldsForOutcome(eq("outcome", "converged"), "converged") {
+		t.Error("eq on a matching outcome must hold")
+	}
+	if HoldsForOutcome(eq("outcome", "converged"), "loop:budget-exhausted") {
+		t.Error("eq held on a different outcome")
+	}
+	// engine.Outcome calls the field Reason, so somebody reading the loop's
+	// own logs reaches for that word. Both names resolve.
+	if !HoldsForOutcome(eq("reason", "converged"), "converged") {
+		t.Error("reason must be accepted as an alias for outcome")
+	}
+
+	in := Predicate{Op: "in", Field: "outcome", Values: []any{"converged", "green"}}
+	if !HoldsForOutcome(in, "green") {
+		t.Error("in must hold for any listed outcome")
+	}
+	if HoldsForOutcome(in, "failed") {
+		t.Error("in held for an unlisted outcome")
+	}
+
+	not := Predicate{Op: "not", Filter: ptr(eq("outcome", "converged"))}
+	if !HoldsForOutcome(not, "failed") {
+		t.Error("not must invert")
+	}
+
+	all := Predicate{Op: "all", Filters: []Predicate{eq("outcome", "converged"), {Op: "exists", Field: "outcome"}}}
+	if !HoldsForOutcome(all, "converged") {
+		t.Error("all must hold when every operand does")
+	}
+
+	// A field this altitude does not expose must not take the edge. An edge
+	// that cannot be evaluated is not one to follow, and the failure shows up
+	// in the summary as a node that never activated rather than as a crash.
+	if HoldsForOutcome(eq("slot.impl.status", "idle"), "converged") {
+		t.Error("an unknown field took the edge; only outcome-shaped facts exist here")
+	}
+	// An empty outcome means the node reported nothing to branch on.
+	if HoldsForOutcome(Predicate{Op: "exists", Field: "outcome"}, "") {
+		t.Error("exists held on an empty outcome")
+	}
+}
+
+func ptr(p Predicate) *Predicate { return &p }

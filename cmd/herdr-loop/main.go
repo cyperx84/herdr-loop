@@ -73,6 +73,8 @@ func run(args []string) error {
 		return cmdDoctor(ctx, args[1:])
 	case "probe":
 		return cmdProbe(args[1:])
+	case "graph":
+		return cmdGraph(ctx, args[1:])
 	case "-h", "--help", "help":
 		printUsage()
 		return nil

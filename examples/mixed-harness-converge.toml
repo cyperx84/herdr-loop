@@ -36,7 +36,7 @@ name = "review"
 kind = "pi"
 cwd  = "."   # set to your repo
 # Cheapest capable model: this slot only reads two files and answers one line.
-args = ["--model", "claude-haiku-4-5"]
+# args = ["--model", "..."]   # see the caveat above before pinning pi a model
 
 [[rule]]
 when = { op = "all", filters = [

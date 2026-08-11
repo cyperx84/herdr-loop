@@ -34,6 +34,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	// Flags still override the env, so `herdr-loop run` works standalone
 	// from a plain shell too.
 	kindsPath := fs.String("kinds", envOr("HERDR_LOOP_KINDS_FILE", "kinds.toml"), "kinds.toml path (optional — absent file is not an error)")
+	teardown := fs.Bool("teardown", false, "on finish, close each slot's pane and remove the worktree this run created (never one named directly in the manifest, and never one holding uncommitted work)")
 	reconcileSecs := fs.Int("reconcile-interval", envOrInt("HERDR_LOOP_RECONCILE_INTERVAL_SECS", int(state.DefaultReconcileInterval/time.Second)), "seconds between authoritative agent.list reconciles")
 	logLevel := fs.String("log-level", envOr("HERDR_LOOP_LOG_LEVEL", "info"), "debug|info|warn|error")
 	if err := fs.Parse(args); err != nil {
@@ -51,41 +52,102 @@ func cmdRun(ctx context.Context, args []string) error {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLogLevel(*logLevel)}))
 
+	reconcileEvery := time.Duration(*reconcileSecs) * time.Second
+	if reconcileEvery <= 0 {
+		reconcileEvery = state.DefaultReconcileInterval
+	}
+
+	opts := loopOptions{
+		ManifestPath:   manifestPath,
+		KindsPath:      *kindsPath,
+		ReconcileEvery: reconcileEvery,
+		Teardown:       *teardown,
+		Log:            log,
+		WriteRunState:  true,
+	}
+	_, err := runLoopFile(ctx, opts)
+	return err
+}
+
+// loopOptions is everything runLoopFile needs. A struct rather than a long
+// parameter list because a graph node supplies most of it from the graph's
+// own settings, and positional arguments would make that call unreadable.
+type loopOptions struct {
+	ManifestPath   string
+	KindsPath      string
+	ReconcileEvery time.Duration
+	Teardown       bool
+	Log            *slog.Logger
+	// WriteRunState records this loop in the state dir so `status` and `stop`
+	// can find it. True for a top-level run; false for a loop running as a
+	// graph node, where the graph owns that record and a nested loop
+	// overwriting it would make `status` describe the wrong thing.
+	WriteRunState bool
+}
+
+// runLoopFile runs one loop manifest to completion and reports its outcome.
+//
+// Extracted from cmdRun so a graph node can run a loop and branch on what it
+// returned. The outcome is the value a graph edge's predicate reads — without
+// it a node could only report "finished", which is not enough to decide what
+// happens next.
+func runLoopFile(ctx context.Context, opts loopOptions) (engine.Outcome, error) {
+	manifestPath := opts.ManifestPath
+	log := opts.Log
+	reconcileEvery := opts.ReconcileEvery
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return fmt.Errorf("run: %w", err)
+		return engine.Outcome{}, fmt.Errorf("run: %w", err)
 	}
 	m, err := manifest.Parse(data)
 	if err != nil {
-		return fmt.Errorf("run: %s: %w", manifestPath, err)
+		return engine.Outcome{}, fmt.Errorf("run: %s: %w", manifestPath, err)
 	}
 	res, err := mapManifest(m)
 	if err != nil {
-		return fmt.Errorf("run: %s: %w", manifestPath, err)
+		return engine.Outcome{}, fmt.Errorf("run: %s: %w", manifestPath, err)
 	}
 
 	client, err := herdr.Open()
 	if err != nil {
-		return fmt.Errorf("run: %w", err)
+		return engine.Outcome{}, fmt.Errorf("run: %w", err)
 	}
 	// Pinned protocol check (PLAN §4.13): refuse to run against a server this
 	// client was not built for, with a clear message, rather than sending it
 	// requests it may not understand.
 	if err := client.CheckProtocol(ctx); err != nil {
-		return fmt.Errorf("run: %w", err)
+		return engine.Outcome{}, fmt.Errorf("run: %w", err)
 	}
 
 	if err := resolveWorktrees(ctx, client, &res); err != nil {
-		return fmt.Errorf("run: %w", err)
+		return engine.Outcome{}, fmt.Errorf("run: %w", err)
 	}
 
-	kinds, err := loadKinds(*kindsPath)
+	kinds, err := loadKinds(opts.KindsPath)
 	if err != nil {
-		return fmt.Errorf("run: %w", err)
+		return engine.Outcome{}, fmt.Errorf("run: %w", err)
 	}
 	res.Config.Kinds = kinds
+	res.Config.TeardownOnFinish = opts.Teardown
 	if err := checkKindCapacity(res.Config.Slots, kinds); err != nil {
-		return fmt.Errorf("run: %w", err)
+		return engine.Outcome{}, fmt.Errorf("run: %w", err)
+	}
+	if opts.Teardown {
+		// Say what it will touch before it runs. Teardown is the one
+		// irreversible thing here, and a run that quietly removes checkouts
+		// is a bad surprise even when it is what was asked for.
+		var owned []string
+		for _, sc := range res.Config.Slots {
+			if sc.Worktree {
+				owned = append(owned, fmt.Sprintf("%s (%s)", sc.Name, sc.CWD))
+			}
+		}
+		if len(owned) == 0 {
+			log.Info("teardown requested, but no slot has a worktree this run created; nothing will be removed")
+		} else {
+			log.Info("teardown on finish", "worktrees", strings.Join(owned, ", "),
+				"note", "a worktree holding uncommitted work is preserved and escalated, never removed")
+		}
 	}
 
 	rs := runState{
@@ -106,22 +168,17 @@ func cmdRun(ctx context.Context, args []string) error {
 		}
 	}()
 
-	reconcileEvery := time.Duration(*reconcileSecs) * time.Second
-	if reconcileEvery <= 0 {
-		reconcileEvery = state.DefaultReconcileInterval
-	}
-
 	idx := newNameIndex(res.Config.Slots)
 	sm := state.New(teeingSnapshotter{client: client, idx: idx}, state.Options{ReconcileEvery: reconcileEvery})
 
 	bus, err := newEventBus(ctx, client)
 	if err != nil {
-		return fmt.Errorf("run: %w", err)
+		return engine.Outcome{}, fmt.Errorf("run: %w", err)
 	}
 	defer bus.Close()
 
 	if err := goLive(ctx, sm, bus); err != nil {
-		return fmt.Errorf("run: %w", err)
+		return engine.Outcome{}, fmt.Errorf("run: %w", err)
 	}
 	log.Info("state model live", "reconciles", sm.Stats().Reconciles)
 
@@ -131,7 +188,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 	eng, err := engine.New(res.Config, client, modelAdapter{state: sm, idx: idx}, log)
 	if err != nil {
-		return fmt.Errorf("run: %w", err)
+		return engine.Outcome{}, fmt.Errorf("run: %w", err)
 	}
 
 	// Observability, not correctness: a loop that cannot publish progress
@@ -151,7 +208,7 @@ func cmdRun(ctx context.Context, args []string) error {
 
 	outcome, err := eng.Run(ctx, transitions)
 	if err != nil && !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("run: %w", err)
+		return engine.Outcome{}, fmt.Errorf("run: %w", err)
 	}
 	log.Info("loop finished", "reason", outcome.Reason, "rule", outcome.Rule,
 		"iterations", outcome.Iterations, "escalations", len(outcome.Escalations))
@@ -169,7 +226,7 @@ func cmdRun(ctx context.Context, args []string) error {
 			To: esc.Status, Detail: esc.Reason,
 		})
 	}
-	return nil
+	return outcome, nil
 }
 
 // goLive drains the replayed event prefix and reconciles until state.Model
@@ -264,6 +321,13 @@ func resolveWorktrees(ctx context.Context, client *herdr.Client, res *mapResult)
 		}
 		res.Config.Slots[req.SlotIndex].CWD = created.Worktree.Path
 		res.Config.Slots[req.SlotIndex].WorkspaceID = created.Workspace.ID
+		// Marks this slot's checkout as ours to remove. Set ONLY here, on the
+		// path that just created the worktree, and never for a slot given a
+		// bare cwd in the manifest: that directory is the user's own repo and
+		// teardown must never be able to reach it. Both fields come from this
+		// one `created` result, so the tree teardown checks for uncommitted
+		// work is necessarily the same tree it would remove.
+		res.Config.Slots[req.SlotIndex].Worktree = true
 		// created.RootPane is the new workspace's own first pane, but
 		// engine.Spawn always opens a second pane via pane.split rather than
 		// accepting a caller-supplied one (see engine.go's Spawn) — so this
@@ -348,11 +412,17 @@ func feed(
 					defer lk.Unlock()
 					deliverInitialPrompt(ctx, eng, tr.PaneID, slot, text, log)
 				}()
-				// The kickoff counts as this slot's first turn. Without it a
-				// slot whose only work is its bootstrap prompt could never
-				// satisfy a rule: the engine requires an observed turn, and
-				// this one was delivered outside the rule path.
-				eng.MarkWorked(slot)
+				// Deliberately NOT marking a turn here. Delivering the prompt
+				// is not the turn — the work it causes is, and that shows up
+				// as the agent leaving `working`, which the engine records on
+				// its own.
+				//
+				// Marking it here made the slot rule-eligible immediately, so
+				// the first settled transition after delivery fired the rules
+				// before the agent had done anything. Observed as a gate
+				// running four times in three seconds against untouched code,
+				// burning the iteration budget while the agent was still
+				// reading its task.
 				return
 			}
 		}
