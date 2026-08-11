@@ -130,10 +130,20 @@ func cmdRun(ctx context.Context, args []string) error {
 		return fmt.Errorf("run: %w", err)
 	}
 
+	// Observability, not correctness: a loop that cannot publish progress
+	// still runs. Losing the surface is bad; refusing to work because a file
+	// would not open would be worse.
+	prog, err := newProgressWriter(res.Config.Name, res.Config.MaxIterations)
+	if err != nil {
+		log.Warn("progress surface unavailable; the loop will run unwatchable", "err", err)
+	}
+	defer prog.Close()
+	prog.Append(logEntry{Event: "loop_started", Detail: manifestPath})
+
 	spawnAll(ctx, eng, res.Config.Slots, log)
 
 	transitions := make(chan engine.Transition, 64)
-	go feed(ctx, sm, bus, idx, eng, client, reconcileEvery, res.InitialPrompts, transitions, log)
+	go feed(ctx, sm, bus, idx, eng, client, reconcileEvery, res.InitialPrompts, transitions, prog, log)
 
 	outcome, err := eng.Run(ctx, transitions)
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -141,8 +151,19 @@ func cmdRun(ctx context.Context, args []string) error {
 	}
 	log.Info("loop finished", "reason", outcome.Reason, "rule", outcome.Rule,
 		"iterations", outcome.Iterations, "escalations", len(outcome.Escalations))
+	prog.Append(logEntry{
+		Event: "loop_finished", Rule: outcome.Rule,
+		Detail: fmt.Sprintf("%s (%d iteration(s), %d escalation(s))",
+			outcome.Reason, outcome.Iterations, len(outcome.Escalations)),
+	})
 	for _, esc := range outcome.Escalations {
 		log.Warn("escalation", "detail", esc.String())
+		// §4.11: the escalation carries its reason into the log too, so the
+		// history says why a slot stopped, not merely that it did.
+		prog.Append(logEntry{
+			At: esc.At, Event: "escalation", Slot: esc.Slot, Rule: esc.Rule,
+			To: esc.Status, Detail: esc.Reason,
+		})
 	}
 	return nil
 }
@@ -262,6 +283,7 @@ func feed(
 	reconcileEvery time.Duration,
 	initialPrompts map[string]string,
 	out chan<- engine.Transition,
+	prog *progressWriter,
 	log *slog.Logger,
 ) {
 	defer close(out)
@@ -319,6 +341,12 @@ func feed(
 				return
 			}
 		}
+		prog.Append(logEntry{
+			At: tr.At, Event: "slot_status", Slot: slot,
+			From: tr.From, To: tr.To, Detail: string(tr.Tier),
+		})
+		publishProgress(sm, idx, eng, prog)
+
 		select {
 		case out <- engine.Transition{Slot: slot, From: tr.From, To: tr.To, At: tr.At}:
 		case <-ctx.Done():
@@ -376,4 +404,34 @@ func parseLogLevel(s string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// publishProgress rebuilds the per-slot snapshot from the authoritative model.
+//
+// Derived rather than accumulated: the model is the source of truth for slot
+// state (PLAN §4.9), so recomputing from it cannot drift the way a separately
+// maintained counter would.
+func publishProgress(sm *state.Model, idx *nameIndex, eng *engine.Engine, prog *progressWriter) {
+	if prog == nil {
+		return
+	}
+	names := idx.slots()
+	slots := make([]slotProgress, 0, len(names))
+	for _, name := range names {
+		sp := slotProgress{Slot: name, Halted: eng.Halted(name)}
+		pane, ok := idx.paneFor(name)
+		if !ok {
+			slots = append(slots, sp)
+			continue
+		}
+		sp.Pane = pane
+		if ag, ok := sm.Get(pane); ok {
+			sp.Status = ag.Status
+			sp.Tier = ag.Tier
+			sp.Since = ag.Since
+			sp.Kind = ag.Kind
+		}
+		slots = append(slots, sp)
+	}
+	prog.Update(slots, eng.Iterations(), sm.IsLive(), eng.EscalationCount())
 }

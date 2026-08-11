@@ -1118,6 +1118,18 @@ func (e *Engine) halt(slot string) {
 // Halted reports whether a slot has been halted by policy.
 func (e *Engine) Halted(slot string) bool { return e.isHalted(slot) }
 
+// Iterations reports how much of the budget has been spent. Exported for the
+// progress surface: "iteration 7 of 10" is the number that tells a watcher
+// whether a loop is converging or about to hit its cap.
+func (e *Engine) Iterations() int { return e.iterationCount() }
+
+// EscalationCount reports how many escalations have been raised so far.
+func (e *Engine) EscalationCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.escalations)
+}
+
 func (e *Engine) isHalted(slot string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()

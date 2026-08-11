@@ -822,37 +822,44 @@ claude-flow, tmux orchestrators) — for design patterns and known failure modes
 ## 12. Known gaps — honest status as of 2026-08-11
 
 Both repos are green: `gofmt`, `go vet`, `go test -race`, and cross-compilation to
-windows/amd64, linux/amd64, linux/arm64 and darwin/arm64. ~6,900 lines of Go in
-herdr-loop, ~3,000 in herdr-api. An adversarial review found seven defects; five are
-fixed with regression tests that fail against the old behaviour. What remains:
+windows/amd64, linux/amd64, linux/arm64 and darwin/arm64. An adversarial review found
+seven defects; all seven are now closed, each with a regression test that fails against
+the old behaviour.
 
-**Not yet implemented — tracked, not hidden:**
+**Closed since the review:**
 
-1. **Detection tier never reaches the engine (F3).** `state.Tier` is computed correctly
-   from `screen_detection_skipped` and carried on every transition, then dropped by the
-   engine's `Model` interface. No rule can gate on trust, and `strict` (§4.6) exists only
-   in comments. At runtime a screen-classified heuristic `done` is treated identically to
-   a structured one. `doctor` does report the tier, so this is advisory-but-unenforced
-   rather than invisible. Fix: `SlotTier` on `engine.Model`, a `tier` predicate field,
-   and a `Config.Strict` that refuses irreversible actions on `TierScreen`.
-2. **§4.9 corroboration is not actually implemented.** The requirement is to confirm the
-   process is alive (`pane.process_info`) before acting on an inferred state. The engine's
-   current measure re-reads the model at fire time, which re-reads *the same inference*.
-   Impact is limited today because the engine only prompts and spawns rather than merging
-   or tearing down — but the code comments read as if it were covered, which is worse than
-   a gap. Needs `PaneProcessInfo` on the `Herdr` interface.
-3. **`run` actions are designed but not executed.** `validate` refuses them loudly rather
+- F1 going live mid-replay, F2 the never-released concurrency token, F4 the bootstrap
+  prompt bypassing the per-slot lock, F5 corrupted drop metrics (fixed with F1),
+  F6 the unconstructible `pane.output_matched` subscription, F7 a shipped example the
+  binary rejected.
+- F3 detection tier now reaches the rules: `Model.SlotTier`, a `tier` predicate field,
+  and `loop.strict` refusing to fire against a screen-classified slot.
+- §4.9 corroboration is now real, not described: the engine probes `pane.process_info`
+  before spending an iteration and refuses to act on a pane holding no foreground
+  process. A self-reporting agent is not probed — its status is observed, not inferred —
+  and a probe that errors is inconclusive rather than proof of death.
+- §4c demand items 1, 2 and 5: structured escalation reasons, the per-slot progress and
+  append-only log surface, and escalation reaching an OS notification.
+
+**Still open, tracked not hidden:**
+
+1. **`run` actions are designed but not executed.** `validate` refuses them loudly rather
    than letting a rule silently never fire, which is the right failure, but the escape
-   hatch promised in §3 is absent.
-4. **The five demand-driven requirements (§4c) are specified, not built**: structured
-   escalation reason, teardown-never-destroys-uncommitted-work (currently vacuous —
-   `WorktreeRemove` has no caller, so nothing can destroy anything yet), per-slot progress
-   and log surface, escalation-to-notification hook.
-5. **No live `pane_agent_status_changed` has been observed end to end.** Decoders are
+   hatch promised in §3 is absent. This is the largest remaining functional gap.
+2. **Teardown safety (§4.10) is vacuously satisfied.** `WorktreeRemove` exists in
+   herdr-api but has no caller in herdr-loop and `halt` kills nothing, so nothing can
+   destroy uncommitted work yet. The invariant must be built *with* the first teardown
+   path, not after it — the prior-art incident it comes from was exactly that ordering
+   mistake.
+3. **No live `pane_agent_status_changed` observed end to end.** Decoders are
    contract-tested against real captured frames, but the wire path for the one signal the
-   engine gates on is still unproven against a running agent. Closing it means spawning an
-   agent — use `opencode`, which is structurally detected (§4.6) and runs keyless, rather
-   than an OAuth-authenticated kind.
+   engine gates on is unproven against a running agent. Closing it means spawning an
+   agent: use `opencode`, which self-reports (§4.6) and runs keyless, rather than an
+   OAuth-authenticated kind.
+4. **`strict` is honest but currently near-unusable.** As of herdr 0.8.0 only `pi` and
+   `opencode` self-report, so a strict loop over Claude Code or Codex slots will not fire
+   at all. The right fix is upstream — contributing structured status reporting to those
+   integrations — not weakening the check here.
 
 **Verified genuinely enforced in code**, not merely described — confirmed by adversarial
 review reading the implementation: escalate-by-default with whole-string prompt matching

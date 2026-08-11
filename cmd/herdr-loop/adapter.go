@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"sort"
 	"sync"
 
 	herdr "github.com/cyperx84/herdr-api"
@@ -27,6 +28,19 @@ type nameIndex struct {
 
 func newNameIndex() *nameIndex {
 	return &nameIndex{byName: make(map[string]string)}
+}
+
+// slots lists every slot name the index knows, sorted so progress output is
+// stable between reads rather than reordering on every map iteration.
+func (n *nameIndex) slots() []string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	out := make([]string, 0, len(n.byName))
+	for name := range n.byName {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // update folds the Name/PaneID of every agent.list record into the index. It
