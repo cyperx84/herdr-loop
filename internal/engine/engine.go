@@ -69,6 +69,9 @@ type Herdr interface {
 	AgentSendKeys(ctx context.Context, target string, keys []string) error
 	AgentStart(ctx context.Context, params herdr.AgentStartParams) (herdr.AgentStartResult, error)
 	PaneSplit(ctx context.Context, params herdr.PaneSplitParams) (herdr.Pane, error)
+	// TabCreate gives a slot its own tab — the default placement, so each
+	// agent gets a full-size pane rather than an ever-narrower sliver.
+	TabCreate(ctx context.Context, params herdr.TabCreateParams) (herdr.TabCreated, error)
 	NotificationShow(ctx context.Context, params herdr.NotificationShowParams) (herdr.NotificationShowResult, error)
 	// PaneSendText writes raw text to a pane. Needed for control sequences
 	// herdr's key vocabulary does not cover — S-Tab among them.
@@ -196,7 +199,17 @@ type SlotConfig struct {
 	// engine's.
 	CWD         string
 	WorkspaceID string
-	// Direction is the split axis for this slot's pane. Empty means
+	// Placement decides where this slot's pane comes from: "tab" (default)
+	// gives the slot its own tab, "split" divides the current pane.
+	//
+	// Tab is the default because splitting does not survive a fleet. Each
+	// extra slot halves a dimension, and a coding agent's TUI degrades badly
+	// once its pane is narrow — observed with opencode at two slots, where
+	// the interface wrapped one character per line and stopped accepting
+	// input at all, so the loop's prompts went nowhere. A tab gives every
+	// agent the full window, which is also how a human would arrange this.
+	Placement string
+	// Direction is the split axis when Placement is "split". Empty means
 	// herdr.SplitRight.
 	Direction herdr.SplitDirection
 	Args      []string
@@ -1189,18 +1202,9 @@ func (e *Engine) Spawn(ctx context.Context, slot string) error {
 		}
 	}()
 
-	dir := sc.Direction
-	if dir == "" {
-		dir = herdr.SplitRight
-	}
-	pane, err := e.client.PaneSplit(ctx, herdr.PaneSplitParams{
-		Direction:   dir,
-		WorkspaceID: sc.WorkspaceID,
-		CWD:         sc.CWD,
-		Env:         e.SlotEnv(slot),
-	})
+	paneID, err := e.slotPane(ctx, slot, sc)
 	if err != nil {
-		return fmt.Errorf("engine: pane.split %s: %w", slot, err)
+		return err
 	}
 	// A freshly split pane is not immediately an available shell: its shell
 	// is still starting, and agent.start requires the shell itself to be in
@@ -1208,23 +1212,23 @@ func (e *Engine) Spawn(ctx context.Context, slot string) error {
 	// fails with agent_pane_busy — observed against herdr 0.8.0, not
 	// theorised, and it is the ordinary case rather than a race that
 	// sometimes bites.
-	if err := e.waitForShell(ctx, pane.ID); err != nil {
+	if err := e.waitForShell(ctx, paneID); err != nil {
 		return fmt.Errorf("engine: %s: %w", slot, err)
 	}
-	if err := e.startAgent(ctx, slot, sc, pane.ID); err != nil {
+	if err := e.startAgent(ctx, slot, sc, paneID); err != nil {
 		return err
 	}
 	// Before anything is asked of it: put the harness into a state where the
 	// answer will be work rather than a description of work.
-	e.applyStartupKeys(ctx, slot, pane.ID)
+	e.applyStartupKeys(ctx, slot, paneID)
 
 	// Publish the mapping before returning, so a transition arriving in the
 	// next moment can be attributed to this slot.
 	if e.cfg.OnSpawn != nil {
-		e.cfg.OnSpawn(slot, pane.ID)
+		e.cfg.OnSpawn(slot, paneID)
 	}
 	release = false
-	e.log.Info("slot spawned", "slot", slot, "kind", sc.Kind, "pane", pane.ID,
+	e.log.Info("slot spawned", "slot", slot, "kind", sc.Kind, "pane", paneID,
 		HandoffEnv, e.HandoffPath(slot))
 	return nil
 }
@@ -1273,6 +1277,55 @@ func (e *Engine) startAgent(ctx context.Context, slot string, sc SlotConfig, pan
 		}
 	}
 }
+
+// slotPane creates the pane a slot's agent will live in.
+//
+// Both paths carry the handoff env: pane.split and tab.create each accept an
+// env map, which agent.start does not, so the variable has to go in when the
+// pane is made either way.
+func (e *Engine) slotPane(ctx context.Context, slot string, sc SlotConfig) (string, error) {
+	env := e.SlotEnv(slot)
+
+	if sc.Placement == PlacementSplit {
+		dir := sc.Direction
+		if dir == "" {
+			dir = herdr.SplitRight
+		}
+		pane, err := e.client.PaneSplit(ctx, herdr.PaneSplitParams{
+			Direction:   dir,
+			WorkspaceID: sc.WorkspaceID,
+			CWD:         sc.CWD,
+			Env:         env,
+		})
+		if err != nil {
+			return "", fmt.Errorf("engine: pane.split %s: %w", slot, err)
+		}
+		return pane.ID, nil
+	}
+
+	// Default: the slot gets a whole tab, labelled with its name so the
+	// herdr UI reads as the loop's structure rather than a row of anonymous
+	// panes.
+	label := slot
+	params := herdr.TabCreateParams{Label: &label, Env: env}
+	if sc.CWD != "" {
+		params.CWD = &sc.CWD
+	}
+	if sc.WorkspaceID != "" {
+		params.WorkspaceID = &sc.WorkspaceID
+	}
+	created, err := e.client.TabCreate(ctx, params)
+	if err != nil {
+		return "", fmt.Errorf("engine: tab.create %s: %w", slot, err)
+	}
+	return created.RootPane.ID, nil
+}
+
+// Placement values for SlotConfig.
+const (
+	PlacementTab   = "tab"
+	PlacementSplit = "split"
+)
 
 // ShellReadyTimeout bounds the wait for a freshly split pane's shell to reach
 // its prompt. Generous: a cold shell with a heavy rc file is slow, and the

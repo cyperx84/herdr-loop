@@ -75,3 +75,8 @@ func (noopHerdr) PaneSendText(context.Context, string, string) error { return er
 func (noopHerdr) AgentGet(context.Context, string) (herdr.Agent, error) {
 	return herdr.Agent{}, errNoConnection
 }
+
+// TabCreate is never called during validate — no session exists.
+func (noopHerdr) TabCreate(context.Context, herdr.TabCreateParams) (herdr.TabCreated, error) {
+	return herdr.TabCreated{}, errNoConnection
+}

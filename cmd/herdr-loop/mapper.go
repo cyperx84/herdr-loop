@@ -91,6 +91,7 @@ func mapManifest(m *manifest.Manifest) (mapResult, error) {
 			Name: s.Name,
 			Kind: s.Kind,
 			CWD:  s.CWD, // left empty for a worktree slot; resolveWorktrees fills it in
+			Args: s.Args,
 		})
 		if s.Worktree != nil {
 			res.Worktrees = append(res.Worktrees, worktreeRequest{

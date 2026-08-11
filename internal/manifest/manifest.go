@@ -76,6 +76,19 @@ type Slot struct {
 	CWD      string    `toml:"cwd"`
 	Worktree *Worktree `toml:"worktree"`
 	Prompt   string    `toml:"prompt"`
+	// Args are passed through to the harness's own command line, after the
+	// `--` that herdr uses to separate its flags from the agent's.
+	//
+	// This is how a loop controls what it costs. A converge loop can burn a
+	// frontier model's quota in a handful of iterations, and the model is the
+	// single biggest lever on that — so it belongs in the manifest, next to
+	// the work, rather than being whatever the harness happens to default to:
+	//
+	//	args = ["--model", "sonnet"]
+	//
+	// The flags are the harness's, not herdr's, so they differ per kind and
+	// are passed through unread.
+	Args []string `toml:"args"`
 }
 
 // Predicate is a boolean expression over slot/agent state, evaluated by the

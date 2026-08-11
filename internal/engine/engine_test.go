@@ -32,6 +32,7 @@ type fakeHerdr struct {
 	starts   []herdr.AgentStartParams
 	notified []herdr.NotificationShowParams
 
+	tabs          []herdr.TabCreateParams
 	sentText      []string
 	sendTextErr   error
 	processProbes []string
@@ -76,6 +77,29 @@ func (f *fakeHerdr) AgentStart(_ context.Context, p herdr.AgentStartParams) (her
 	f.startedPanes[p.PaneID] = true
 	f.mu.Unlock()
 	return herdr.AgentStartResult{Agent: herdr.Agent{PaneID: p.PaneID}}, f.startErr
+}
+
+// TabCreate models the default placement: a whole tab per slot. Spawn's
+// default placement is "tab", not "split" (§Placement in engine.go), so this
+// runs the same onSplit hook PaneSplit does — tests that use the hook to
+// observe spawn concurrency must see it regardless of which pane-creation
+// path a slot is configured for, or they deadlock waiting on a hook that
+// never fires (found via TestPerSlotMutexAllowsOneActionInFlight hanging
+// after the tab-placement change).
+func (f *fakeHerdr) TabCreate(_ context.Context, p herdr.TabCreateParams) (herdr.TabCreated, error) {
+	f.mu.Lock()
+	f.tabs = append(f.tabs, p)
+	id := "pane-" + string(rune('0'+len(f.tabs)))
+	hook := f.onSplit
+	if f.splitPanes == nil {
+		f.splitPanes = map[string]bool{}
+	}
+	f.splitPanes[id] = true
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return herdr.TabCreated{RootPane: herdr.RootPane{ID: id}}, nil
 }
 
 func (f *fakeHerdr) PaneSplit(_ context.Context, p herdr.PaneSplitParams) (herdr.Pane, error) {
@@ -637,10 +661,12 @@ func TestPerSlotMutexAllowsOneActionInFlight(t *testing.T) {
 	<-done
 
 	client.mu.Lock()
-	splits := len(client.splits)
+	// Default placement is "tab" (PlacementTab), so Spawn calls tab.create,
+	// not pane.split — see the TabCreate doc comment above.
+	tabs := len(client.tabs)
 	client.mu.Unlock()
-	if splits != 1 {
-		t.Errorf("pane.split calls = %d, want 1 — the contended action is skipped, not queued", splits)
+	if tabs != 1 {
+		t.Errorf("tab.create calls = %d, want 1 — the contended action is skipped, not queued", tabs)
 	}
 }
 
@@ -704,9 +730,9 @@ func TestUnknownKindGetsConservativeConcurrency(t *testing.T) {
 	}
 }
 
-// Every slot is spawned with HERDR_LOOP_HANDOFF pointing at its own file, and
-// that variable can only go in at pane.split time — agent.start has no env
-// field in protocol 19.
+// Every slot is spawned with HERDR_LOOP_HANDOFF pointing at its own file.
+// Default placement is "tab" (PlacementTab, see engine.go), so the env lands
+// via tab.create; agent.start has no env field in protocol 19 either way.
 func TestSpawnInjectsHandoffEnvAtPaneSplit(t *testing.T) {
 	client := &fakeHerdr{}
 	cfg := baseConfig(t)
@@ -718,10 +744,10 @@ func TestSpawnInjectsHandoffEnvAtPaneSplit(t *testing.T) {
 
 	client.mu.Lock()
 	defer client.mu.Unlock()
-	if len(client.splits) != 1 || len(client.starts) != 1 {
-		t.Fatalf("split/start calls = %d/%d, want 1/1", len(client.splits), len(client.starts))
+	if len(client.tabs) != 1 || len(client.starts) != 1 {
+		t.Fatalf("tab.create/start calls = %d/%d, want 1/1", len(client.tabs), len(client.starts))
 	}
-	got := client.splits[0].Env[HandoffEnv]
+	got := client.tabs[0].Env[HandoffEnv]
 	if want := e.HandoffPath("impl"); got != want {
 		t.Errorf("%s = %q, want %q", HandoffEnv, got, want)
 	}
@@ -729,9 +755,9 @@ func TestSpawnInjectsHandoffEnvAtPaneSplit(t *testing.T) {
 		t.Errorf("handoff path %q is outside handoff_dir %q", got, cfg.HandoffDir)
 	}
 	// agent.start carries no env of its own, so it must land on the pane the
-	// split just created or the handoff variable never reaches the agent.
+	// tab just created or the handoff variable never reaches the agent.
 	if client.starts[0].PaneID == "" {
-		t.Error("agent.start was not addressed at the pane created by the split")
+		t.Error("agent.start was not addressed at the pane created by the tab")
 	}
 	if client.starts[0].Kind != "claude" {
 		t.Errorf("Kind = %q, want the slot's configured kind", client.starts[0].Kind)
