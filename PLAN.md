@@ -879,3 +879,74 @@ and no implicit enter; settled-state-only prompting; `unknown` excluded from set
 one-worktree-per-slot; parse-time cycle detection (a real Tarjan SCC pass) backed by a
 runtime iteration budget; SHA256 verification in the build bootstrap that fails closed and
 could not be bypassed under test.
+
+---
+
+## 13. Direction: graphs are this engine recursed, not a second plugin
+
+Loops are not the top of the model. A loop converges one fleet of agents on one piece of
+work; real work is a **graph of loops** — compose any harnesses herdr can run into a
+larger structure where each node is itself a converging fleet. This section records how
+that lands, and why it is not a separate plugin, so the reasoning is not rediscovered.
+
+### The loop is already a graph
+
+§3's model is `slots + rules + predicates`, and `validate` runs a Tarjan SCC pass over
+the slot data-flow graph to prove every cycle is bounded. A graph of loops is the same
+shape one level up: nodes, edges, predicates. The right move is therefore to generalize
+the *node* — a node is either a **slot** (one agent) or a **nested loop** — rather than to
+build a second engine that reimplements evaluation, reconciliation, and policy.
+
+```
+graph.toml          nodes + edges + predicates
+   ├─ node "impl"   → loop.toml   (slots + rules)   converges internally
+   ├─ node "review" → loop.toml
+   └─ node "ship"   → slot         a single agent
+        edges carry the same predicate DSL and the same handoff contract
+```
+
+A plain loop is a graph with one node, so today's manifests keep working unchanged.
+
+### Why not a second plugin
+
+Not a taste call. Every scarce resource this engine manages is **global to the machine**,
+and splitting the engine across two processes breaks each one:
+
+| Resource | What splitting it costs |
+|---|---|
+| Per-kind concurrency tokens (§4.7) | The credential race is machine-wide. Two processes each enforcing "max 2 claude" yields four concurrent agents racing one rotating OAuth token — the exact failure the cap exists to prevent. |
+| The reconciled state model (§4.8) | `state.Model` requires `Apply`/`Reconcile` be driven from one goroutine. Two owners means two divergent models of one session, and no way to decide which is right. |
+| Event subscriptions (§4.12) | herdr's bus has no subscriber-ordering guarantee — observed via `herdr-reviewr` #5, two plugins racing on `worktree.created`. A second subscriber to the same panes reproduces that bug by construction, and doubles the replay each connection must drain. |
+| Worktrees (§4.2) | One owner per working tree. Two planners allocating worktrees cannot see each other's claims. |
+
+**herdr also offers no channel to bridge them.** `plugin.action.invoke` takes
+`{plugin_id, action_id, context}` where context is a fixed workspace/pane/selection
+struct. It fires an action; it does not carry a payload and does not return data. There is
+no plugin-to-plugin data surface at all. A graph plugin driving a loop plugin would have
+to shell out or reimplement the engine — the duplication argument again, with worse
+ergonomics and a coordination problem in the middle.
+
+One supervisor, one state model, one concurrency budget, one event stream.
+
+### Not built now — deliberately
+
+`herdr-loop` has not run end to end once (§12). Building a composition layer above a thing
+that has never executed is speculative infrastructure, and the footprint ladder says the
+bar for new surface is high. Adding it now would also mean designing edges against a rule
+engine whose real-world behaviour is still unobserved.
+
+What is worth doing now, at near-zero cost, so the recursion is free later:
+
+1. **Do not harden "node == one agent."** Keep the manifest shape able to admit a nested
+   loop where a slot sits today, rather than baking the assumption into types and
+   validation.
+2. **Keep the predicate DSL and handoff contract identical at both levels.** Edges between
+   nodes should evaluate the same `all`/`any`/`not`/`eq`/`in`/`exists` predicates over the
+   same file-based handoff that rules already use. One contract, two altitudes.
+3. **Keep termination validation altitude-agnostic.** The SCC cycle check should be able to
+   run over a node graph without change; a cycle between loops needs a bound for exactly
+   the reasons a cycle between slots does.
+
+Revisit once a real loop has run and the failure modes of the rule engine are observed
+rather than predicted. The trigger for building this is a concrete piece of work that
+genuinely needs two loops composed — not the fact that it would be elegant.
