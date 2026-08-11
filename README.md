@@ -320,9 +320,6 @@ see it. Never a bare timeout.
 
 ## Limitations, stated plainly
 
-- **No tagged release yet.** `herdr plugin install` needs a local Go toolchain today; the
-  prebuilt-binary fallback in `scripts/build.sh` has placeholder checksums until a `v0.1.0`
-  tag exists.
 - **Graph nodes run sequentially, never concurrently**, and a node that names a bare `slot`
   instead of a nested `loop` fails explicitly rather than executing anything — see
   [Graphs](#graphs).

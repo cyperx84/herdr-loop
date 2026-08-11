@@ -70,17 +70,20 @@ platform_target() {
 
 target=$(platform_target)
 
-# SHA256 of the release asset for each target, pinned here rather than
-# fetched from the release alongside the binary (see header comment). No
-# tagged release exists yet, so every entry is a placeholder that
-# deliberately fails the check below until this script is updated for a real
-# v0.1.0 tag.
+# SHA256 of the release asset for each target, pinned here rather than fetched
+# from the release alongside the binary (see header comment): a checksum served
+# from the same place as the artifact proves only that the download was not
+# truncated, not that the artifact is the one this script intended to run.
+#
+# Values come from the SHA256SUMS published by .github/workflows/release.yml,
+# which prints them in the job log for exactly this purpose. Update both
+# together when cutting a release.
 expected_sha256() {
     case "$1" in
-        darwin-arm64) echo "UNRELEASED" ;;
-        darwin-amd64) echo "UNRELEASED" ;;
-        linux-amd64)  echo "UNRELEASED" ;;
-        linux-arm64)  echo "UNRELEASED" ;;
+        darwin-arm64) echo "0eeb92fa1579bd82a2fcfaee34cd3906afacb5782899252c475c9455bb3822fe" ;;
+        darwin-amd64) echo "deed754a0a5a388f34b8988577b6c25ed578eb2c8a8dc7e5745e02a5b54a9fe5" ;;
+        linux-amd64)  echo "370728845f55da0e9959f5b0c9a675e32547b22c593bff3efa51d4ac07482ff5" ;;
+        linux-arm64)  echo "177f5e992017305c06741639bf24d8dcd6a64f3d29094299f3c5346d7ff31b56" ;;
         *) return 1 ;;
     esac
 }
