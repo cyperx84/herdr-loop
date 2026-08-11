@@ -69,18 +69,8 @@ then = { prompt = { slot = "impl", text = "Address {{review.handoff}}" } }
 # code to branch on).
 [[rule]]
 when = { op = "eq", field = "review.handoff.verdict", value = "clean" }
-then = { finish = "converged" }
-
-# The mechanical gate this loop wants at the end — a test run with the final
-# word — is NOT expressible yet. `run` actions are designed (see PLAN.md §3:
-# an escape hatch that shells out and branches on exit code) but the engine
-# does not execute them, so `herdr-loop validate` rejects any manifest using
-# one rather than letting the rule silently never fire.
-#
-# When run actions land, the rule above becomes:
-#
-#   [[rule]]
-#   when = { op = "eq", field = "review.verdict", value = "clean" }
-#   then = { run = ["cargo", "test"],
-#            on_success = { finish = "green" },
-#            on_failure = { prompt = { slot = "impl", text = "Tests fail:\n{{stdout}}" } } }
+# The mechanical gate has the final word: agents agreeing that the work is
+# done is an opinion, and a test run is not. Argv is executed directly, never
+# through a shell, so {{...}} values expand into single arguments and text an
+# agent wrote can never become executable.
+then = { run = ["go", "test", "./..."], on_success = { finish = "green" }, on_failure = { prompt = { slot = "impl", text = "Tests fail:\n{{stdout}}" } } }

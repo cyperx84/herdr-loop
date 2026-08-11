@@ -169,8 +169,22 @@ func convertAction(a manifest.Action) (engine.Action, error) {
 	case a.Finish != "":
 		return engine.Action{Finish: &engine.FinishAction{Reason: a.Finish}}, nil
 	case a.Run != nil:
-		return engine.Action{}, fmt.Errorf(
-			"action runs %v: the engine does not execute run actions yet (tracked as an M2 gap) — remove this rule or wait for engine support", a.Run)
+		run := &engine.RunAction{Argv: a.Run}
+		if a.OnSuccess != nil {
+			branch, err := convertAction(*a.OnSuccess)
+			if err != nil {
+				return engine.Action{}, fmt.Errorf("on_success: %w", err)
+			}
+			run.OnSuccess = &branch
+		}
+		if a.OnFailure != nil {
+			branch, err := convertAction(*a.OnFailure)
+			if err != nil {
+				return engine.Action{}, fmt.Errorf("on_failure: %w", err)
+			}
+			run.OnFailure = &branch
+		}
+		return engine.Action{Run: run}, nil
 	case a.Escalate:
 		return engine.Action{}, errors.New(
 			"action escalate: the engine has no escalate action yet (tracked as an M2 gap) — remove this rule or wait for engine support")

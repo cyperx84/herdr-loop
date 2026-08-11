@@ -243,6 +243,7 @@ type Action struct {
 	Prompt *PromptAction
 	Spawn  *SpawnAction
 	Finish *FinishAction
+	Run    *RunAction
 }
 
 // Rule is one when/then pair. Name is required — it is what an escalation
@@ -268,6 +269,14 @@ type Config struct {
 	// entirely. Turn it on for loops where acting on a wrong "done" is worse
 	// than not acting at all.
 	Strict bool
+	// RunCWD is where run actions execute when they name no directory of
+	// their own. Empty means the supervisor's working directory.
+	//
+	// Deliberately not a slot's worktree: a gate like "do the tests pass"
+	// asks about the integration point, and defaulting it to whichever slot
+	// happened to trigger the rule would make the same manifest mean
+	// different things depending on which agent finished first.
+	RunCWD string
 	// HandoffDir holds the per-slot result files.
 	HandoffDir   string
 	OnBlocked    BlockedPolicy
@@ -359,6 +368,14 @@ type Engine struct {
 	held      map[string]string
 
 	actions sync.WaitGroup
+
+	// finish carries a loop-ending outcome from an asynchronous action back to
+	// Run. A run action's branch may finish the loop, but it completes in a
+	// dispatched goroutine long after fire returned, so it cannot report an
+	// outcome up the call stack the way a synchronous rule does. Buffered and
+	// written non-blockingly: the first finish wins and later ones are
+	// dropped, because a loop ends once.
+	finish chan Outcome
 }
 
 // New validates cfg and returns an engine bound to a herdr client and a
@@ -431,6 +448,7 @@ func New(cfg Config, client Herdr, model Model, log *slog.Logger) (*Engine, erro
 		slots:     slots,
 		halted:    map[string]bool{},
 		locks:     map[string]*sync.Mutex{},
+		finish:    make(chan Outcome, 1),
 		kindGates: map[string]chan struct{}{},
 		held:      map[string]string{},
 	}, nil
@@ -468,13 +486,13 @@ func validatePredicate(p Predicate) error {
 
 func validateAction(a Action, slots map[string]SlotConfig) error {
 	n := 0
-	for _, set := range []bool{a.Prompt != nil, a.Spawn != nil, a.Finish != nil} {
+	for _, set := range []bool{a.Prompt != nil, a.Spawn != nil, a.Finish != nil, a.Run != nil} {
 		if set {
 			n++
 		}
 	}
 	if n != 1 {
-		return fmt.Errorf("action must set exactly one of prompt/spawn/finish, got %d", n)
+		return fmt.Errorf("action must set exactly one of prompt/spawn/finish/run, got %d", n)
 	}
 	switch {
 	case a.Prompt != nil:
@@ -491,6 +509,27 @@ func validateAction(a Action, slots map[string]SlotConfig) error {
 	case a.Finish != nil:
 		if a.Finish.Reason == "" {
 			return errors.New("finish has no reason")
+		}
+	case a.Run != nil:
+		if len(a.Run.Argv) == 0 {
+			return errors.New("run has no argv")
+		}
+		// Branches are validated with the same rules, so a branch targeting an
+		// unknown slot is caught here rather than at fire time — by which point
+		// the command has already run and its result would be discarded.
+		for _, br := range []struct {
+			name string
+			act  *Action
+		}{{"on_success", a.Run.OnSuccess}, {"on_failure", a.Run.OnFailure}} {
+			if br.act == nil {
+				continue
+			}
+			if br.act.Run != nil {
+				return fmt.Errorf("%s: nested run actions are not supported", br.name)
+			}
+			if err := validateAction(*br.act, slots); err != nil {
+				return fmt.Errorf("%s: %w", br.name, err)
+			}
 		}
 	}
 	return nil
@@ -535,11 +574,30 @@ func (e *Engine) Run(ctx context.Context, transitions <-chan Transition) (Outcom
 			cancel()
 			e.actions.Wait()
 			return e.outcome(ReasonCanceled, ""), ctx.Err()
+		case out := <-e.finish:
+			// An asynchronous action asked to end the loop (a run action's
+			// branch reaching finish). Same teardown as a synchronous finish.
+			cancel()
+			e.actions.Wait()
+			out.Iterations = e.iterationCount()
+			out.Escalations = e.takeEscalations()
+			return out, nil
 		case tr, ok := <-transitions:
 			if !ok {
 				// Graceful end of stream: let dispatched actions land before
 				// reporting, so the outcome describes finished work.
 				e.actions.Wait()
+				// An action that landed during that wait may have asked to
+				// end the loop — a run action's gate passing, say. Its
+				// outcome is the real one; reporting stream-closed over it
+				// would discard the answer the loop was waiting for.
+				select {
+				case out := <-e.finish:
+					out.Iterations = e.iterationCount()
+					out.Escalations = e.takeEscalations()
+					return out, nil
+				default:
+				}
 				return e.outcome(ReasonStreamClosed, ""), nil
 			}
 			out, done := e.step(runCtx, tr)
@@ -703,6 +761,12 @@ func (e *Engine) fire(ctx context.Context, r Rule, f *facts, tr Transition) (Out
 		e.dispatch(ctx, lk, slot, r.Name, func(ctx context.Context) error {
 			return e.Spawn(ctx, slot)
 		})
+
+	case r.Then.Run != nil:
+		branchSlot, _ := actionSlot(r.Then)
+		e.dispatch(ctx, lk, branchSlot, r.Name, func(ctx context.Context) error {
+			return e.runAction(ctx, r, f, *r.Then.Run)
+		})
 	}
 	return Outcome{}, false
 }
@@ -714,6 +778,21 @@ func actionSlot(a Action) (string, bool) {
 		return a.Prompt.Slot, true
 	case a.Spawn != nil:
 		return a.Spawn.Slot, true
+	case a.Run != nil:
+		// A run action touches no slot itself, but its branches may. Report
+		// the branch's slot so the per-slot lock is taken up front: without
+		// it, a long build could finish and prompt a slot that a rule started
+		// prompting meanwhile, racing two prompts into one agent.
+		if a.Run.OnSuccess != nil {
+			if slot, ok := actionSlot(*a.Run.OnSuccess); ok {
+				return slot, true
+			}
+		}
+		if a.Run.OnFailure != nil {
+			if slot, ok := actionSlot(*a.Run.OnFailure); ok {
+				return slot, true
+			}
+		}
 	}
 	return "", false
 }
@@ -835,7 +914,13 @@ func (e *Engine) dispatch(ctx context.Context, lk *sync.Mutex, slot, rule string
 	e.actions.Add(1)
 	go func() {
 		defer e.actions.Done()
-		defer lk.Unlock()
+		// lk is nil for an action that owns no slot — a run action whose
+		// branches only finish the loop, for instance. Not every action
+		// contends for an agent, so an absent lock is a normal case rather
+		// than a caller error.
+		if lk != nil {
+			defer lk.Unlock()
+		}
 		if err := fn(ctx); err != nil {
 			if errors.Is(err, context.Canceled) {
 				e.log.Debug("action canceled", "slot", slot, "rule", rule)
@@ -1245,10 +1330,23 @@ type facts struct {
 	slot     string
 	status   herdr.AgentStatus
 	handoffs map[string]*Handoff
+	// overlay holds fields contributed by the action in progress — a finished
+	// run action's stdout, stderr and exit_code. Checked before the general
+	// resolvers so {{stdout}} means "the command that just ran" rather than
+	// resolving to nothing.
+	overlay map[string]string
 }
 
 func (e *Engine) newFacts(slot string, status herdr.AgentStatus) *facts {
 	return &facts{e: e, slot: slot, status: status, handoffs: map[string]*Handoff{}}
+}
+
+// withOverlay returns a copy carrying extra template fields. A copy, not a
+// mutation: the branch action's view must not leak back into the rule's.
+func (f *facts) withOverlay(extra map[string]string) *facts {
+	cp := *f
+	cp.overlay = extra
+	return &cp
 }
 
 func (e *Engine) holds(p Predicate, f *facts) bool {
@@ -1296,6 +1394,9 @@ func (e *Engine) holds(p Predicate, f *facts) bool {
 // not exist yet is the normal state before a slot's first result, and every
 // operator treats false as "does not hold", which is the safe direction.
 func (f *facts) resolve(field string) (string, bool) {
+	if v, ok := f.overlay[field]; ok {
+		return v, true
+	}
 	switch field {
 	case "slot":
 		return f.slot, true

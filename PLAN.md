@@ -843,9 +843,28 @@ the old behaviour.
 
 **Still open, tracked not hidden:**
 
-1. **`run` actions are designed but not executed.** `validate` refuses them loudly rather
-   than letting a rule silently never fire, which is the right failure, but the escape
-   hatch promised in §3 is absent. This is the largest remaining functional gap.
+1. ~~**`run` actions are designed but not executed.**~~ **CLOSED.** The engine runs them
+   and branches on the exit code, with the command's stdout/stderr/exit_code expanded
+   into the branch's templates so a failing gate hands the agent its own error output.
+
+   Argv is executed directly, **never through a shell** — a deliberate security boundary,
+   not a style choice. Run actions carry expanded template values, and those values may
+   contain text an agent wrote; a shell would make agent-authored text executable.
+   Executing argv directly means an expanded value is always exactly one argument
+   whatever characters it holds. Pinned by a test that fires five metacharacter payloads
+   (`; touch`, `$(…)`, backticks, `&&`, `|`) and asserts none of them execute.
+
+   Three failure modes are kept distinct because conflating them lies to the user: a
+   command that exits nonzero is a gate result and branches; a command that times out is
+   reported as timed out rather than as an ordinary failure; and a command that could not
+   be started at all (binary missing, cwd gone) escalates rather than branching, because
+   "the tests failed" is the wrong answer when the truth is the test runner is not
+   installed. Output is capped at 64 KB from the tail, marked when truncated.
+
+   Two bugs surfaced while wiring it, both fixed: `dispatch` unconditionally unlocked a
+   slot lock that is nil for an action owning no slot, and `Run` discarded a finish
+   requested by an action that landed during the stream-close drain — a passing gate's
+   verdict would have been reported as "stream closed".
 2. **Teardown safety (§4.10) is vacuously satisfied.** `WorktreeRemove` exists in
    herdr-api but has no caller in herdr-loop and `halt` kills nothing, so nothing can
    destroy uncommitted work yet. The invariant must be built *with* the first teardown

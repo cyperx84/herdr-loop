@@ -126,23 +126,86 @@ func TestMapManifestRuleNamesAreDeterministic(t *testing.T) {
 // than silently dropping the rule — a manifest author who wrote a run rule
 // and had it vanish with no error is worse off than one who gets told it
 // isn't supported yet.
-func TestMapManifestRejectsRunAction(t *testing.T) {
-	const withRun = noRunManifest + `
+func TestMapManifestConvertsRunActionWithBranches(t *testing.T) {
+	const src = `
+[loop]
+name = "gate"
+max_iterations = 5
+
+[[slot]]
+name = "impl"
+kind = "opencode"
+cwd = "/tmp/impl"
+
 [[rule]]
-when = { op = "eq", field = "slot.verify.status", value = "done" }
-then = { run = ["cargo", "test"], on_success = { finish = "green" } }
+when = { op = "eq", field = "slot", value = "impl" }
+then = { run = ["go", "test", "./..."], on_success = { finish = "green" }, on_failure = { prompt = { slot = "impl", text = "Tests fail:\n{{stdout}}" } } }
 `
-	_, err := mapManifest(mustParse(t, withRun))
-	if err == nil {
-		t.Fatal("mapManifest: want an error for a run action, got nil")
+	m, err := manifest.Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
 	}
-	if !strings.Contains(err.Error(), "run action") {
-		t.Errorf("error %q does not explain that run actions are unsupported", err)
+	res, err := mapManifest(m)
+	if err != nil {
+		t.Fatalf("mapManifest: %v", err)
+	}
+	if len(res.Config.Rules) != 1 {
+		t.Fatalf("rules = %d, want 1", len(res.Config.Rules))
+	}
+	run := res.Config.Rules[0].Then.Run
+	if run == nil {
+		t.Fatal("run action was not converted")
+	}
+	if got := strings.Join(run.Argv, " "); got != "go test ./..." {
+		t.Errorf("argv = %q", got)
+	}
+	if run.OnSuccess == nil || run.OnSuccess.Finish == nil || run.OnSuccess.Finish.Reason != "green" {
+		t.Errorf("on_success branch lost: %+v", run.OnSuccess)
+	}
+	if run.OnFailure == nil || run.OnFailure.Prompt == nil || run.OnFailure.Prompt.Slot != "impl" {
+		t.Errorf("on_failure branch lost: %+v", run.OnFailure)
+	}
+	// The failure branch must carry the template through unexpanded — it is
+	// expanded at fire time, against the command's actual output.
+	if !strings.Contains(run.OnFailure.Prompt.Text, "{{stdout}}") {
+		t.Errorf("on_failure text lost its template: %q", run.OnFailure.Prompt.Text)
 	}
 }
 
-// TestMapManifestRejectsEscalateAction mirrors the run case for the other
-// action variant engine.Action cannot express.
+// A gate with no branches is legitimate: the rule exists to stop the loop
+// advancing, and nothing further is wanted on either outcome.
+func TestMapManifestAcceptsBareRunAction(t *testing.T) {
+	const src = `
+[loop]
+name = "gate"
+max_iterations = 5
+
+[[slot]]
+name = "impl"
+kind = "opencode"
+cwd = "/tmp/impl"
+
+[[rule]]
+when = { op = "eq", field = "slot", value = "impl" }
+then = { run = ["true"] }
+`
+	m, err := manifest.Parse([]byte(src))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	res, err := mapManifest(m)
+	if err != nil {
+		t.Fatalf("mapManifest: %v", err)
+	}
+	run := res.Config.Rules[0].Then.Run
+	if run == nil || len(run.Argv) != 1 || run.Argv[0] != "true" {
+		t.Fatalf("bare run action not converted: %+v", run)
+	}
+	if run.OnSuccess != nil || run.OnFailure != nil {
+		t.Error("branches invented where the manifest declared none")
+	}
+}
+
 func TestMapManifestRejectsEscalateAction(t *testing.T) {
 	const withEscalate = noRunManifest + `
 [[rule]]
