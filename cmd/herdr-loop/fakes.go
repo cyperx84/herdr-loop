@@ -80,3 +80,11 @@ func (noopHerdr) AgentGet(context.Context, string) (herdr.Agent, error) {
 func (noopHerdr) TabCreate(context.Context, herdr.TabCreateParams) (herdr.TabCreated, error) {
 	return herdr.TabCreated{}, errNoConnection
 }
+
+// PaneClose is never called during validate — no pane exists.
+func (noopHerdr) PaneClose(context.Context, string) error { return errNoConnection }
+
+// WorktreeRemove is never called during validate — no worktree exists.
+func (noopHerdr) WorktreeRemove(context.Context, string, bool) (herdr.WorktreeRemoved, error) {
+	return herdr.WorktreeRemoved{}, errNoConnection
+}

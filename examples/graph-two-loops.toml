@@ -1,0 +1,52 @@
+# Two loops composed into a graph.
+#
+# A node is either a slot (one agent, exactly as in a loop manifest) or a
+# nested loop referenced by path. Edges carry the same predicate DSL and the
+# same file-based handoff that rules already use, so a plain loop is simply a
+# graph with one node — which is why every existing loop manifest keeps working
+# unchanged.
+#
+# WHAT WORKS TODAY: this file parses, validates, and sequences. `herdr-loop
+# validate` will check its structure, prove its cycle is bounded, and report
+# its shape.
+#
+# WHAT DOES NOT: executing a node's nested loop. The graph layer models and
+# orders the work; running a sub-loop is the next change. Nothing here will
+# start an agent yet.
+
+[graph]
+name  = "build-then-integrate"
+entry = "build"
+# A cycle needs a bound that is actually enforced. max_iterations is checked on
+# every activation; an earlier design accepted a per-edge timeout instead and
+# nothing consumed it, so a graph could pass validation and run forever. That
+# key is now rejected rather than quietly ignored.
+max_iterations = 12
+
+# ── Node one: implement and review until the tests pass ──────────────────────
+# This is examples/mixed-harness-converge.toml — a real, verified loop. A graph
+# node is a whole converging fleet, not a single step.
+[[node]]
+name = "build"
+loop = "mixed-harness-converge.toml"
+
+# ── Node two: integrate the result and verify it holds ───────────────────────
+[[node]]
+name = "integrate"
+loop = "converge-until-clean.toml"
+
+# build finishes cleanly -> integrate starts.
+#
+# The predicate reads the same fields a rule reads, at one altitude up: instead
+# of "this slot settled", it asks "this node's loop reached this outcome".
+[[edge]]
+from = "build"
+when = { op = "eq", field = "outcome", value = "converged" }
+then = { activate = "integrate" }
+
+# integrate fails -> back to build. This is the cycle, and it is why
+# max_iterations above is not optional: without it, validation refuses the file.
+[[edge]]
+from = "integrate"
+when = { op = "eq", field = "outcome", value = "failed" }
+then = { activate = "build" }

@@ -141,6 +141,103 @@ a closed loop: `review` sending `changes-requested` prompts `impl` again, which 
 (arbitrary command, branch on exit code via `on_success`/`on_failure`) gating the finish
 line behind a mechanical check rather than trusting the review verdict alone.
 
+## Graphs
+
+**Not runnable. This section describes a shape, most of it not yet reachable from the CLI.**
+`internal/graph` and `internal/manifest.ParseGraph` parse, validate and sequence a
+`graph.toml` — nodes, edges, the same predicate DSL and Tarjan cycle check a loop uses one
+altitude down — and both are exercised by their own tests
+(`internal/manifest/graph_manifest_test.go` has the grammar in full). What does not exist is
+a caller: nothing in `cmd/herdr-loop` invokes `ParseGraph`, so `herdr-loop validate` cannot
+see a graph.toml today, and `internal/graph.Run` sequences nodes but never executes one — no
+code path spawns a nested loop or reports its outcome back in. A `loop.toml` is still the top
+of what can actually run end to end. This section exists so the target shape is written down
+once, in the same place as everything else, rather than living only in
+[PLAN.md §13](PLAN.md#13-direction-graphs-are-this-engine-recursed-not-a-second-plugin).
+
+A loop, as described above, is `slots + rules`, and the manifest validator already runs a
+real graph algorithm over it — Tarjan's SCC pass over the slot data-flow graph, to prove
+every retrigger cycle is bounded before the loop is allowed to run. A graph of loops is the
+same shape one level up. The move that follows from that observation, and the one this repo
+has committed to without building yet, is to generalize the *node* rather than invent a
+second engine:
+
+- **A node is either a slot (one agent) or a nested loop (a whole converging fleet).** Where
+  today's manifest sketch has `[[slot]]`, a `graph.toml` would have `[[node]]`, and a node
+  can point at a `loop.toml` instead of naming a `kind` directly.
+- **Edges use the same predicate DSL rules already use** — `all`/`any`/`not`/`eq`/`in`/`exists`
+  over the same kind of fields (`node.<name>.status`, a finish reason, a handoff field) —
+  not a second condition language layered on top.
+- **Edges use the same file-based handoff contract**, never pane scrape, for the same reason
+  §4.1 gives it inside one loop: TUI agents run on the terminal alternate screen and rows
+  that scroll off never enter herdr's scrollback.
+- **A plain loop is a graph with one node.** Nothing about today's `loop.toml` manifests
+  needs to change for this to land — they'd simply be the single-node case of the bigger
+  model, same as they are today.
+
+The grammar below is real and parses — `internal/manifest.ParseGraph` accepts exactly this
+shape, pinned by `internal/manifest/graph_manifest_test.go`. What's still a sketch is
+everything *after* parsing: no command in `cmd/herdr-loop` calls `ParseGraph`, so
+`herdr-loop validate` cannot see a file like this yet, and nothing executes a nested loop or
+reports its outcome back onto an edge.
+
+```toml
+# graph.toml — nodes + edges + predicates. Parses today; nothing runs it yet.
+[graph]
+name  = "impl-review-ship"
+entry = "impl-review"
+
+[[slot]]
+name     = "ship"
+kind     = "claude"
+worktree = { branch = "graph/ship", base = "main" }
+
+[[node]]
+name = "impl-review"
+loop = "loop.toml"        # a node can be a whole nested loop, converging internally
+
+[[node]]
+name = "ship"
+slot = "ship"              # ...or a node can be a single slot, same as today
+
+[[edge]]
+from = "impl-review"
+when = { op = "eq", field = "impl-review.finish.reason", value = "converged" }
+then = { activate = "ship" }
+```
+
+**Why not a second plugin, if this is a different altitude.** Not a taste call — every
+scarce resource the engine manages is global to the machine, and splitting it across two
+processes breaks each one. Two processes each enforcing "max 2 claude" yields four
+concurrent Claude Code agents racing one rotating OAuth credential — exactly the failure
+§4.7's cap exists to prevent. `internal/state.Model` needs `Apply`/`Reconcile` driven from
+one goroutine; two owners means two divergent models of one session with no way to decide
+which is right. herdr's event bus gives no subscriber-ordering guarantee, so a second
+subscriber to the same panes reproduces a known plugin-race bug (`herdr-reviewr` #5) by
+construction. And a worktree has exactly one owner, full stop. herdr also offers no
+plugin-to-plugin data channel to coordinate around any of this even if it were worth trying:
+`plugin.action.invoke` fires an action with a fixed context struct, no payload, no return
+value. One supervisor, one state model, one concurrency budget, one event stream — so this
+stays one engine that recurses, not two engines that have to agree.
+
+**Why this repo hasn't executed it yet, deliberately.** A composition layer that actually
+*runs* a graph — spawning a nested loop, feeding its outcome back onto an edge — above an
+engine whose real-world failure modes were still unobserved would have been speculative
+infrastructure — see the Limitations below and the Fixed section of
+[CHANGELOG.md](CHANGELOG.md) for how many of those failure modes only showed up once a real
+loop ran against a real herdr session. Building execution against unobserved behaviour would
+have meant guessing twice. What *was* worth building now, at near-zero risk because none of
+it touches a live herdr session, is the layer below execution: `internal/graph` models,
+validates and sequences a node graph, and `internal/manifest.ParseGraph` parses `graph.toml`
+into it — both real code, both tested, neither wired to a spawn call. The manifest shape does
+not harden "node == one agent"; the predicate DSL and handoff contract are identical at both
+altitudes; and the SCC cycle check runs over a node graph exactly as it runs over a loop's
+slots, because a cycle between loops needs a bound for exactly the same reason a cycle
+between slots does. What's left for the next pass is the part that actually touches a live
+session: a `cmd/herdr-loop` command that calls `ParseGraph`, and an executor that drives
+`graph.Run`'s `Activate`/`Settle`/`Fail` against real nested-loop runs instead of a caller
+scripting them in a test.
+
 ## Safety model
 
 These aren't caveats bolted onto a README — they're requirements the manifest validator

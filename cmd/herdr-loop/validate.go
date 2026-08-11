@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/cyperx84/herdr-loop/internal/engine"
 	"github.com/cyperx84/herdr-loop/internal/manifest"
@@ -39,6 +40,14 @@ func cmdValidate(args []string) error {
 	if err != nil {
 		return fmt.Errorf("validate: %w", err)
 	}
+	// A graph manifest routed through the loop parser parses to nothing and
+	// reports "OK — 0 slot(s), 0 rule(s)", which is a lie by omission: the
+	// file is not a valid loop, it is a different kind of document. Detect it
+	// and validate it as what it is.
+	if isGraphManifest(data) {
+		return validateGraph(path, data)
+	}
+
 	m, err := manifest.Parse(data)
 	if err != nil {
 		return fmt.Errorf("validate: %s: %w", path, err)
@@ -68,5 +77,52 @@ func cmdValidate(args []string) error {
 		fmt.Printf(", %d worktree slot(s)", n)
 	}
 	fmt.Println()
+	return nil
+}
+
+// isGraphManifest reports whether a file is a graph rather than a loop.
+//
+// Keyed on the [graph] table, which a loop manifest never has and a graph
+// manifest always does.
+func isGraphManifest(data []byte) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "#") {
+			continue
+		}
+		if t == "[graph]" {
+			return true
+		}
+		if t == "[loop]" {
+			return false
+		}
+	}
+	return false
+}
+
+// validateGraph checks a graph manifest and reports its shape.
+func validateGraph(path string, data []byte) error {
+	gm, err := manifest.ParseGraph(data)
+	if err != nil {
+		return fmt.Errorf("validate: %s: %w", path, err)
+	}
+	g := gm.Graph()
+	if err := g.Validate(); err != nil {
+		return fmt.Errorf("validate: %s: %w", path, err)
+	}
+
+	slots, loops := 0, 0
+	for _, n := range g.Nodes {
+		if n.Loop != "" {
+			loops++
+		} else {
+			slots++
+		}
+	}
+	fmt.Printf("%s: OK — graph, %d node(s) (%d loop, %d slot), %d edge(s), entry %q\n",
+		path, len(g.Nodes), loops, slots, len(g.Edges), g.Entry)
+	// Say what does not happen yet, so nobody reads OK as "this will run".
+	fmt.Printf("  note: graphs validate and sequence today; executing a node's\n")
+	fmt.Printf("        nested loop is not implemented yet.\n")
 	return nil
 }

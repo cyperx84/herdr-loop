@@ -27,12 +27,14 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -84,12 +86,51 @@ type Herdr interface {
 	// inference that is under suspicion. Asking herdr what process is
 	// actually in the pane is independent evidence.
 	PaneProcessInfo(ctx context.Context, paneID string) (herdr.PaneProcessInfo, error)
+	// PaneClose closes a slot's pane. Teardown's only caller.
+	PaneClose(ctx context.Context, paneID string) error
+	// WorktreeRemove deletes a worktree. Teardown is the only caller in this
+	// package, and only after GitStatus.Dirty has confirmed the tree is
+	// clean — the invariant this method exists to make possible without
+	// ever being reached with force=true from any code path here (§4.10).
+	WorktreeRemove(ctx context.Context, workspaceID string, force bool) (herdr.WorktreeRemoved, error)
 }
 
 // Compile-time proof the interface still tracks the real client: if herdr-api
 // changes one of these signatures, this fails to build instead of the fake and
 // the client silently diverging.
 var _ Herdr = (*herdr.Client)(nil)
+
+// GitStatus reports whether a git working tree has uncommitted changes.
+//
+// The sole caller is Teardown, and the sole reason this exists as an
+// interface rather than a direct exec.Command call inline: a test proving
+// "a dirty worktree survives teardown" must not depend on a real git binary
+// or a real filesystem to exercise the failure mode the invariant exists to
+// close (§4.10, backed by a real data-loss incident — see PLAN §4.10). See
+// fakeGit in engine_test.go.
+type GitStatus interface {
+	// Dirty reports whether dir has uncommitted changes — anything
+	// `git status --porcelain` would print a line for, staged or not,
+	// tracked or not. A non-nil error means the check itself could not be
+	// performed (missing binary, dir not a worktree, and so on); Teardown
+	// treats that as equally disqualifying as a confirmed-dirty result,
+	// because "we don't know" is never grounds to delete a working tree.
+	Dirty(ctx context.Context, dir string) (bool, error)
+}
+
+// execGit is GitStatus's default implementation, run when Config.Git is nil.
+// It shells out to the real `git` on PATH — the one place in this package
+// that does, and only ever to ask a question, never to mutate anything.
+type execGit struct{}
+
+func (execGit) Dirty(ctx context.Context, dir string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "status", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil {
+		return true, fmt.Errorf("git status --porcelain in %s: %w", dir, err)
+	}
+	return len(bytes.TrimSpace(out)) > 0, nil
+}
 
 // Transition is one reconciled change of a slot's agent status.
 //
@@ -219,6 +260,13 @@ type SlotConfig struct {
 	// herdr.SplitRight.
 	Direction herdr.SplitDirection
 	Args      []string
+	// Worktree marks a slot whose CWD is a git worktree materialized
+	// specifically for it (via worktree.create), as opposed to a bare cwd
+	// that merely points at an existing checkout. Teardown calls
+	// worktree.remove only when this is true (§4.10) — deleting a directory
+	// this loop did not create is not this engine's decision to make, no
+	// matter how clean git reports it.
+	Worktree bool
 }
 
 // PredicateOp is one of herdr's own predicate operators, reused so manifest
@@ -340,6 +388,24 @@ type Config struct {
 	Kinds        map[string]KindConfig
 	// Vars are manifest substitutions such as {{task}}.
 	Vars map[string]string
+	// Git is the working-tree inspector Teardown consults before removing a
+	// worktree (§4.10). Nil defaults to the real `git` binary on PATH via
+	// execGit; tests substitute a fake here the same way OnSpawn lets them
+	// substitute pane wiring, never by exec'ing a subprocess.
+	Git GitStatus
+	// TeardownOnFinish tears every configured slot down — kind token, pane,
+	// and worktree if one was created for it — when Run returns on its own
+	// (budget exhausted, a rule finished the loop, the event stream closed).
+	// It does nothing when Run returns because the caller's ctx was
+	// canceled: an operator pulling the plug is not "finished," and a dead
+	// ctx cannot make the herdr calls teardown needs anyway.
+	//
+	// Off by default. A loop's whole point is often to leave a result
+	// sitting in a pane and a worktree for a human to look at, and tearing
+	// that down unasked on the very first successful run would be exactly
+	// the kind of silent surprise this engine works to avoid everywhere
+	// else (§4.10, §4.11).
+	TeardownOnFinish bool
 }
 
 // Escalation is the structured reason a slot or loop stopped.
@@ -355,6 +421,11 @@ type Escalation struct {
 	// Prompt is the approval text a blocked slot was sitting on, when the
 	// model could see it.
 	Prompt string
+	// Path is the filesystem path the escalation concerns. Set by Teardown
+	// when it leaves a worktree in place — §4.10 requires the report be
+	// locatable, not merely a claim that something, somewhere, was dirty.
+	// Empty when not applicable.
+	Path string
 	// Stalled is how long the slot had been in Status. Zero when the
 	// transition carried no timestamp.
 	Stalled time.Duration
@@ -363,14 +434,19 @@ type Escalation struct {
 }
 
 func (e Escalation) String() string {
-	s := fmt.Sprintf("slot %s: %s (status %s", e.Slot, e.Reason, e.Status)
+	s := fmt.Sprintf("slot %s: %s", e.Slot, e.Reason)
+	if e.Status != "" {
+		s += fmt.Sprintf(" (status %s)", e.Status)
+	}
 	if e.Rule != "" {
 		s += ", rule " + e.Rule
+	}
+	if e.Path != "" {
+		s += ", path " + e.Path
 	}
 	if e.Stalled > 0 {
 		s += ", stalled " + e.Stalled.Round(time.Second).String()
 	}
-	s += ")"
 	if e.Err != nil {
 		s += ": " + e.Err.Error()
 	}
@@ -383,7 +459,16 @@ const (
 	ReasonBudgetExhausted = "loop:budget-exhausted"
 	ReasonPaused          = "loop:paused"
 	ReasonStreamClosed    = "loop:stream-closed"
-	ReasonCanceled        = "loop:canceled"
+	// ReasonWorktreeDirty is a teardown escalation: the invariant (§4.10)
+	// found uncommitted changes and refused to remove the worktree.
+	ReasonWorktreeDirty = "loop:teardown-worktree-dirty"
+	// ReasonWorktreeUnverifiable is a teardown escalation distinct from
+	// ReasonWorktreeDirty on purpose: a human reading "dirty" goes looking
+	// for changes to commit, while a human reading "unverifiable" goes
+	// looking for why the check itself failed (git missing, path gone).
+	// Conflating the two sends the wrong person down the wrong path.
+	ReasonWorktreeUnverifiable = "loop:teardown-worktree-unverifiable"
+	ReasonCanceled             = "loop:canceled"
 )
 
 // Outcome is why Run returned.
@@ -406,6 +491,7 @@ type Engine struct {
 	client Herdr
 	model  Model
 	log    *slog.Logger
+	git    GitStatus
 
 	slots map[string]SlotConfig
 
@@ -423,6 +509,19 @@ type Engine struct {
 	// between the calls that started them (§4.7).
 	kindGates map[string]chan struct{}
 	held      map[string]string
+	// panes records the pane Spawn created for a slot, so Teardown can
+	// close it without the caller having to remember or re-derive it.
+	// Cleared by Teardown's own take-semantics (see takePane), so a pane is
+	// closed at most once no matter how Teardown is reached.
+	panes map[string]string
+	// torndown marks a slot Teardown has already fully processed, making a
+	// second call for the same slot a no-op. Manual teardown and
+	// TeardownOnFinish can both reach the same slot — an operator tearing
+	// one down by hand, then the loop finishing normally — and a second
+	// worktree.remove against an already-gone workspace, or a second
+	// escalation for the same dirty tree, is noise a human would have to
+	// re-triage for nothing.
+	torndown map[string]bool
 
 	actions sync.WaitGroup
 
@@ -470,6 +569,9 @@ func New(cfg Config, client Herdr, model Model, log *slog.Logger) (*Engine, erro
 		if _, dup := slots[s.Name]; dup {
 			return nil, fmt.Errorf("engine: New: duplicate slot %q", s.Name)
 		}
+		if s.Worktree && (s.CWD == "" || s.WorkspaceID == "") {
+			return nil, fmt.Errorf("engine: New: slot %q: worktree is true but cwd or workspace_id is empty — teardown could not check or remove it", s.Name)
+		}
 		slots[s.Name] = s
 	}
 
@@ -497,11 +599,17 @@ func New(cfg Config, client Herdr, model Model, log *slog.Logger) (*Engine, erro
 		}
 	}
 
+	git := cfg.Git
+	if git == nil {
+		git = execGit{}
+	}
+
 	return &Engine{
 		cfg:       cfg,
 		client:    client,
 		model:     model,
 		log:       log,
+		git:       git,
 		slots:     slots,
 		halted:    map[string]bool{},
 		locks:     map[string]*sync.Mutex{},
@@ -509,6 +617,8 @@ func New(cfg Config, client Herdr, model Model, log *slog.Logger) (*Engine, erro
 		finish:    make(chan Outcome, 1),
 		kindGates: map[string]chan struct{}{},
 		held:      map[string]string{},
+		panes:     map[string]string{},
+		torndown:  map[string]bool{},
 	}, nil
 }
 
@@ -631,15 +741,13 @@ func (e *Engine) Run(ctx context.Context, transitions <-chan Transition) (Outcom
 			// The loop is over; in-flight actions go with it.
 			cancel()
 			e.actions.Wait()
-			return e.outcome(ReasonCanceled, ""), ctx.Err()
+			return e.finalize(ctx, Outcome{Reason: ReasonCanceled}), ctx.Err()
 		case out := <-e.finish:
 			// An asynchronous action asked to end the loop (a run action's
 			// branch reaching finish). Same teardown as a synchronous finish.
 			cancel()
 			e.actions.Wait()
-			out.Iterations = e.iterationCount()
-			out.Escalations = e.takeEscalations()
-			return out, nil
+			return e.finalize(ctx, out), nil
 		case tr, ok := <-transitions:
 			if !ok {
 				// Graceful end of stream: let dispatched actions land before
@@ -651,32 +759,40 @@ func (e *Engine) Run(ctx context.Context, transitions <-chan Transition) (Outcom
 				// would discard the answer the loop was waiting for.
 				select {
 				case out := <-e.finish:
-					out.Iterations = e.iterationCount()
-					out.Escalations = e.takeEscalations()
-					return out, nil
+					return e.finalize(ctx, out), nil
 				default:
 				}
-				return e.outcome(ReasonStreamClosed, ""), nil
+				return e.finalize(ctx, Outcome{Reason: ReasonStreamClosed}), nil
 			}
 			out, done := e.step(runCtx, tr)
 			if done {
 				cancel()
 				e.actions.Wait()
-				out.Iterations = e.iterationCount()
-				out.Escalations = e.takeEscalations()
-				return out, nil
+				return e.finalize(ctx, out), nil
 			}
 		}
 	}
 }
 
-func (e *Engine) outcome(reason, rule string) Outcome {
-	return Outcome{
-		Reason:      reason,
-		Rule:        rule,
-		Iterations:  e.iterationCount(),
-		Escalations: e.takeEscalations(),
+// finalize is Run's single exit path: every return funnels through it, so
+// TeardownOnFinish sees every reason a loop can end and the escalation drain
+// below always happens after any teardown escalation has been raised, never
+// before it. Draining first would silently drop a dirty-worktree escalation
+// from the very report a human is meant to read (§4.10, §4.11).
+//
+// ctx here is Run's own parameter, not the runCtx already canceled by the
+// caller — checking ctx.Err() is how this tells "the loop finished" apart
+// from "the caller pulled the plug," and only the former runs teardown: a
+// canceled ctx cannot make the herdr or git calls teardown needs anyway, and
+// leaving everything up is what "still there to inspect" means for a run
+// that was interrupted rather than concluded.
+func (e *Engine) finalize(ctx context.Context, out Outcome) Outcome {
+	if e.cfg.TeardownOnFinish && ctx.Err() == nil {
+		e.teardownAll(ctx)
 	}
+	out.Iterations = e.iterationCount()
+	out.Escalations = e.takeEscalations()
+	return out
 }
 
 // step is the whole fold: one transition in, at most one loop-ending outcome
@@ -1260,6 +1376,12 @@ func (e *Engine) Spawn(ctx context.Context, slot string) error {
 	if err != nil {
 		return err
 	}
+	// Recorded as soon as the pane exists, not after the agent starts: even
+	// a spawn that fails past this point has left a pane behind, and
+	// Teardown needs to find it regardless of how far the spawn got.
+	e.mu.Lock()
+	e.panes[slot] = paneID
+	e.mu.Unlock()
 	// A freshly split pane is not immediately an available shell: its shell
 	// is still starting, and agent.start requires the shell itself to be in
 	// the foreground at an interactive prompt. Calling straight through
@@ -1381,6 +1503,49 @@ const (
 	PlacementSplit = "split"
 )
 
+// PaneGoneTimeout bounds the wait for a closed pane's process to actually go
+// away before a worktree may be removed.
+const PaneGoneTimeout = 10 * time.Second
+
+// waitPaneGone confirms a closed pane's process is really gone.
+//
+// pane.close returning success is not that proof: herdr reports no meaningful
+// result beyond success, and the shell may still be reaping the agent. PLAN
+// §4.9 requires corroboration before irreversible work, and removing a
+// worktree is the most irreversible thing this engine does — so the one place
+// the rule matters most is the one place it must not be skipped.
+//
+// Asking pane.process_info is the independent evidence: once the pane is gone
+// herdr stops knowing about it, and an error is the answer we want. A pane
+// still reporting a foreground command means something is alive in it.
+func (e *Engine) waitPaneGone(ctx context.Context, paneID string) error {
+	deadline := time.Now().Add(PaneGoneTimeout)
+	for {
+		info, err := e.client.PaneProcessInfo(ctx, paneID)
+		if err != nil {
+			// herdr no longer knows this pane: it is gone, which is exactly
+			// what was asked.
+			return nil
+		}
+		if !info.RunsForegroundCommand() {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			name := "a process"
+			if len(info.ForegroundProcesses) > 0 {
+				name = strconv.Quote(info.ForegroundProcesses[0].Name)
+			}
+			return fmt.Errorf("pane %s still runs %s %s after close; not touching its worktree",
+				paneID, name, PaneGoneTimeout)
+		}
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 // ShellReadyTimeout bounds the wait for a freshly split pane's shell to reach
 // its prompt. Generous: a cold shell with a heavy rc file is slow, and the
 // cost of waiting too long is a slower spawn, while the cost of not waiting
@@ -1431,6 +1596,178 @@ func (e *Engine) waitForShell(ctx context.Context, paneID string) error {
 // Release gives a slot's concurrency token back. Callers tearing a slot down
 // must call it, or the kind's limit stays consumed for the rest of the run.
 func (e *Engine) Release(slot string) { e.releaseKind(slot) }
+
+// Teardown releases everything Spawn acquired for a slot: its kind
+// concurrency token, its pane, and — only when SlotConfig.Worktree marks
+// this slot's cwd as a worktree materialized for it — the worktree itself.
+// Use this instead of Release plus a manual pane.close/worktree.remove
+// whenever a slot's resources are being given up for good, whether that is
+// a human tearing one slot down by hand or TeardownOnFinish tearing every
+// slot down when the loop ends.
+//
+// Idempotent: a second call for the same slot is a no-op, so manual
+// teardown and TeardownOnFinish reaching the same slot cannot double-remove
+// a worktree or double-escalate a dirty one.
+//
+// The kind token is released first and unconditionally, before the pane
+// close or worktree check are even attempted — nothing that follows may
+// fail, or find a dirty tree, and leave the kind's concurrency gate
+// consumed for the rest of the run (§4.7). Everything after that point is
+// best-effort and independently reported: a pane-close failure does not
+// stop the worktree check, and a worktree correctly left in place because
+// it is dirty is Teardown succeeding at its one non-negotiable job, not
+// Teardown failing.
+//
+// The invariant this method exists to add (§4.10): before ANY worktree
+// removal, its working tree is checked for uncommitted changes via
+// GitStatus.Dirty. A dirty result — or a check that could not be performed
+// at all, treated identically, because "we don't know" is never grounds to
+// delete a working tree — stops the removal. Nothing here commits or
+// stashes on anyone's behalf; that judgment call belongs to whoever left
+// the tree dirty, not to a teardown path making it for them. The tree is
+// preserved exactly as it stood, logged loudly with its path, and raised as
+// an escalation (§4.11) so a human finds it rather than discovering later
+// that it is simply gone — the exact incident this invariant was written to
+// close (sean1588/herdr-orchestrator #34, cited in PLAN §4.10: a force
+// removal on a no-PR escalation destroyed a completed-but-uncommitted
+// implementation).
+func (e *Engine) Teardown(ctx context.Context, slot string) error {
+	e.mu.Lock()
+	if e.torndown[slot] {
+		e.mu.Unlock()
+		return nil
+	}
+	e.torndown[slot] = true
+	e.mu.Unlock()
+
+	// Unconditional and first: see the doc comment above for why nothing
+	// past this line may gate it.
+	e.releaseKind(slot)
+
+	sc, ok := e.slots[slot]
+	if !ok {
+		return fmt.Errorf("engine: teardown: unknown slot %q", slot)
+	}
+
+	var errs []error
+
+	// Whether the pane actually went away decides whether the worktree may be
+	// touched at all. A pane that failed to close still holds a live agent
+	// with that worktree as its cwd, and `git status` asked a moment later
+	// reports clean simply because the agent has not written yet. Removing on
+	// that reading destroys work that was about to exist — the same incident
+	// the dirty-tree check exists to prevent, reached by a different route.
+	paneGone := true
+	if paneID, held := e.takePane(slot); held {
+		if err := e.client.PaneClose(ctx, paneID); err != nil {
+			paneGone = false
+			errs = append(errs, fmt.Errorf("engine: teardown %s: pane.close %s: %w", slot, paneID, err))
+		} else if err := e.waitPaneGone(ctx, paneID); err != nil {
+			// A successful close is not proof the process is gone: herdr
+			// reports no meaningful result beyond success, and the shell may
+			// still be reaping. §4.9 says corroborate before irreversible
+			// work, and nothing in this system is more irreversible than this.
+			paneGone = false
+			errs = append(errs, fmt.Errorf("engine: teardown %s: %w", slot, err))
+		}
+	}
+
+	if sc.Worktree {
+		switch {
+		case !paneGone:
+			// Preserve and say why. The slot keeps its worktree and a human
+			// decides — which is the whole posture of this path.
+			e.escalate(ctx, Escalation{
+				Slot: slot, Reason: ReasonWorktreeUnverifiable, Path: sc.CWD,
+				Err: errors.New("pane did not close; an agent may still be writing to this worktree"),
+				At:  time.Now(),
+			})
+		default:
+			if err := e.teardownWorktree(ctx, slot, sc); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// teardownAll tears every configured slot down. Best-effort and complete
+// rather than fail-fast: one slot's dirty worktree or unreachable pane must
+// not stop the rest of the loop's resources from being released, and it is
+// exactly the caller of Run that already learns about individual failures
+// through the Outcome's escalations and this engine's own logging, so
+// nothing here is swallowed — it just isn't allowed to abort the sweep.
+func (e *Engine) teardownAll(ctx context.Context) {
+	for slot := range e.slots {
+		if err := e.Teardown(ctx, slot); err != nil {
+			e.log.Error("teardown failed", "slot", slot, "err", err)
+		}
+	}
+}
+
+// takePane returns and clears a slot's recorded pane, if Spawn ever created
+// one. Clearing it is what makes a second Teardown call for the same slot
+// skip pane.close instead of sending it a second time against an ID herdr
+// may already have forgotten.
+func (e *Engine) takePane(slot string) (string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	id, ok := e.panes[slot]
+	if ok {
+		delete(e.panes, slot)
+	}
+	return id, ok
+}
+
+// teardownWorktree is Teardown's worktree half, split out because the
+// check-then-remove sequence is the entire invariant this file exists to
+// add and deserves to be readable on its own.
+//
+// force is always false in the worktree.remove call below — not just as a
+// default, but as the point: this engine has already established the tree
+// is clean, so it asks herdr to remove an already-known-clean worktree
+// rather than to force through whatever check herdr itself would otherwise
+// apply. That keeps herdr's own safety net live as a second, independent
+// check, and it closes the gap between this check and the removal call
+// (however small) without ever needing force=true to do it — §4.10 requires
+// force removal of a dirty worktree be unreachable from any code path here,
+// and the only way to make that true rather than merely usually true is to
+// never pass force=true at all.
+func (e *Engine) teardownWorktree(ctx context.Context, slot string, sc SlotConfig) error {
+	if sc.CWD == "" || sc.WorkspaceID == "" {
+		return fmt.Errorf("engine: teardown %s: worktree=true but cwd or workspace_id is empty — cannot check or remove it", slot)
+	}
+
+	status, _ := e.model.SlotStatus(slot)
+
+	dirty, err := e.git.Dirty(ctx, sc.CWD)
+	if err != nil {
+		e.log.Error("worktree could not be checked for uncommitted changes; not removing",
+			"slot", slot, "path", sc.CWD, "err", err)
+		e.escalate(ctx, Escalation{
+			Slot: slot, Status: status, Reason: ReasonWorktreeUnverifiable,
+			Path: sc.CWD, Err: err, At: time.Now(),
+		})
+		return fmt.Errorf("engine: teardown %s: worktree status check on %s: %w", slot, sc.CWD, err)
+	}
+	if dirty {
+		e.log.Warn("worktree has uncommitted changes; not removing (§4.10)",
+			"slot", slot, "path", sc.CWD)
+		e.escalate(ctx, Escalation{
+			Slot: slot, Status: status, Reason: ReasonWorktreeDirty,
+			Path: sc.CWD, At: time.Now(),
+		})
+		return nil
+	}
+
+	res, err := e.client.WorktreeRemove(ctx, sc.WorkspaceID, false)
+	if err != nil {
+		return fmt.Errorf("engine: teardown %s: worktree.remove %s: %w", slot, sc.CWD, err)
+	}
+	e.log.Info("worktree removed", "slot", slot, "path", res.Path)
+	return nil
+}
 
 func (e *Engine) kindConfig(kind string) KindConfig {
 	kc := e.cfg.Kinds[kind]

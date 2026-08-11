@@ -32,6 +32,7 @@ type fakeHerdr struct {
 	starts   []herdr.AgentStartParams
 	notified []herdr.NotificationShowParams
 
+	gonePanes     []string
 	tabs          []herdr.TabCreateParams
 	sentText      []string
 	sendTextErr   error
@@ -46,6 +47,19 @@ type fakeHerdr struct {
 	// onSplit runs inside PaneSplit, so a test can observe concurrency at the
 	// moment the kind gate admits a spawn.
 	onSplit func()
+
+	// closedPanes and removedWorktrees record Teardown's own calls, in
+	// order, so a test can assert both what was torn down and — just as
+	// importantly for §4.10 — what was not.
+	closedPanes      []string
+	removedWorktrees []removeWorktreeCall
+	closeErr         error
+	removeErr        error
+}
+
+type removeWorktreeCall struct {
+	workspaceID string
+	force       bool
 }
 
 type promptCall struct{ target, text string }
@@ -145,6 +159,46 @@ func (f *fakeHerdr) NotificationShow(_ context.Context, p herdr.NotificationShow
 	return herdr.NotificationShowResult{Shown: true, Reason: herdr.NotificationShown}, nil
 }
 
+// PaneClose records the pane Teardown asked to close.
+func (f *fakeHerdr) PaneClose(_ context.Context, paneID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closedPanes = append(f.closedPanes, paneID)
+	if f.closeErr == nil {
+		// A closed pane stops running anything. Modelled, because teardown
+		// corroborates the process is really gone before touching a worktree
+		// and a fake that kept reporting a live agent would make every
+		// teardown look unverifiable.
+		delete(f.startedPanes, paneID)
+		delete(f.splitPanes, paneID)
+		f.gonePanes = append(f.gonePanes, paneID)
+	}
+	return f.closeErr
+}
+
+func (f *fakeHerdr) paneIsGone(paneID string) bool {
+	for _, p := range f.gonePanes {
+		if p == paneID {
+			return true
+		}
+	}
+	return false
+}
+
+// WorktreeRemove records the call Teardown makes only after its own dirty
+// check has passed. A test asserting §4.10 reads f.removedWorktrees to
+// prove a dirty slot never reached this method at all, and reads .force on
+// every recorded call to prove none of them is ever true.
+func (f *fakeHerdr) WorktreeRemove(_ context.Context, workspaceID string, force bool) (herdr.WorktreeRemoved, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removedWorktrees = append(f.removedWorktrees, removeWorktreeCall{workspaceID, force})
+	if f.removeErr != nil {
+		return herdr.WorktreeRemoved{}, f.removeErr
+	}
+	return herdr.WorktreeRemoved{WorkspaceID: workspaceID, Forced: force}, nil
+}
+
 func (f *fakeHerdr) promptCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -161,6 +215,37 @@ func (f *fakeHerdr) notifyCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.notified)
+}
+
+// fakeGit stands in for GitStatus so a test can prove the §4.10 invariant —
+// a dirty worktree survives teardown — without a real git binary, a real
+// filesystem, or a real uncommitted change ever existing. dirty maps a
+// worktree path to its canned answer; a path with no entry is clean, which
+// keeps every test that does not care about this explicit rather than
+// accidentally exercising the dirty path.
+type fakeGit struct {
+	mu      sync.Mutex
+	dirty   map[string]bool
+	err     error
+	checked []string
+}
+
+func newFakeGit() *fakeGit { return &fakeGit{dirty: map[string]bool{}} }
+
+func (g *fakeGit) Dirty(_ context.Context, dir string) (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.checked = append(g.checked, dir)
+	if g.err != nil {
+		return true, g.err
+	}
+	return g.dirty[dir], nil
+}
+
+func (g *fakeGit) checkedCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.checked)
 }
 
 // fakeModel stands in for the reconciled state model. It answers from a plain
@@ -218,6 +303,10 @@ func (f *fakeHerdr) PaneProcessInfo(_ context.Context, paneID string) (herdr.Pan
 	f.processProbes = append(f.processProbes, paneID)
 	if f.procErr != nil {
 		return herdr.PaneProcessInfo{}, f.procErr
+	}
+	if f.paneIsGone(paneID) {
+		// herdr stops knowing about a closed pane; the error is the answer.
+		return herdr.PaneProcessInfo{}, errors.New("herdr: pane_not_found")
 	}
 	if f.procGone {
 		return herdr.PaneProcessInfo{PaneID: paneID}, nil
