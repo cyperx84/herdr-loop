@@ -1,0 +1,53 @@
+# Mixed-harness converge loop — VERIFIED END TO END on herdr 0.8.0.
+#
+# Claude Code writes, pi reviews, a real `go test` run decides. Two vendors,
+# two panes, one loop. Recorded run: 2 iterations, 0 escalations, reason
+# "converged", and the diff was the correct fix.
+#
+#   impl   idle -> working      kickoff prompt
+#   impl   working -> idle      turn finished  (screen-classified)
+#   review idle -> working      <- the handoff, cross-vendor
+#   review working -> idle      turn finished  (structured)
+#   gate   go test ./...        exit 0 -> converged
+#
+# Both slots pin a cheap model. A converge loop can burn a frontier model's
+# quota in a handful of iterations, and the model is the biggest lever on that.
+[loop]
+name             = "mixed-converge"
+max_iterations   = 8
+handoff_dir      = ".herdr-loop/handoff"
+on_blocked       = "escalate"
+allow_shared_cwd = true   # impl writes, review only reads
+
+[[slot]]
+name = "impl"
+kind = "claude"
+cwd  = "."   # set to your repo
+# Pin the cheap model. A converge loop can burn a frontier model's quota in a
+# handful of iterations, and the model is the biggest lever on that.
+args = ["--model", "sonnet"]
+prompt = """
+Reverse() in str.go is wrong for multi-byte characters. Fix it so every case in
+str_test.go passes. Edit str.go directly. Reply DONE when finished.
+"""
+
+[[slot]]
+name = "review"
+kind = "pi"
+cwd  = "."   # set to your repo
+# Cheapest capable model: this slot only reads two files and answers one line.
+args = ["--model", "claude-haiku-4-5"]
+
+[[rule]]
+when = { op = "all", filters = [
+  { op = "eq", field = "slot",   value = "impl" },
+  { op = "in", field = "status", values = ["idle", "done"] },
+] }
+then = { prompt = { slot = "review", text = "Read str.go. If Reverse handles multi-byte runes correctly, reply exactly CLEAN. Otherwise name the one problem in a single line." } }
+
+[[rule]]
+when = { op = "all", filters = [
+  { op = "eq", field = "slot",   value = "review" },
+  { op = "in", field = "status", values = ["idle", "done"] },
+] }
+then = { run = ["go", "test", "./..."], on_success = { finish = "converged" }, on_failure = { prompt = { slot = "impl", text = "Tests still fail. Fix str.go.\n\n{{stdout}}" } } }

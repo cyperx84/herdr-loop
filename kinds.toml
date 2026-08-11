@@ -37,7 +37,9 @@ startup_settle_ms = 6000
 
 # ── Pi ────────────────────────────────────────────────────────────────────────
 [pi]
-# Also self-reporting. Keep the cap low: pi routes through a subscription.
+# Also self-reporting, and the most reliable reviewer measured so far: it takes
+# a prompt and completes a turn without a settle delay or a startup sequence.
+# Keep the cap low — pi routes through a subscription.
 max_concurrent = 1
 
 # ── Codex ─────────────────────────────────────────────────────────────────────
@@ -45,6 +47,12 @@ max_concurrent = 1
 # Screen-classified, so a strict loop will refuse it until that changes
 # upstream. Shares a ChatGPT credential, hence one at a time.
 max_concurrent = 1
+# Codex asks "do you trust the contents of this directory?" the first time it
+# starts anywhere new, and that lands as `blocked`. The loop escalates and
+# halts the slot rather than answering — pressing enter there would be an agent
+# granting itself trust over a directory, which is the whole reason
+# escalate-by-default exists. Trust the directory yourself, once, before
+# putting codex in a loop:  codex  (then answer it) in that directory.
 
 # ── Everything else ───────────────────────────────────────────────────────────
 # gemini, cursor, amp, droid, kimi, grok, hermes, copilot, kilo, qodercli,
