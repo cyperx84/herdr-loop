@@ -15,9 +15,18 @@
 #
 #   kind      detection    interactive   first turn   notes
 #   pi        structured   3.13s         0.50s        fastest; best reviewer
-#   opencode  structured   3.12s         33.54s       slow turns, no settle needed
-#   claude    screen       3.02s         2.51s        needs plan-mode disarm
-#   codex     screen       3.02s         1.00s        1 retry on pane readiness
+#   opencode  structured   3.12s         33.54s       slow turns; keyless/free
+#   claude    screen       3.02s         2.51s        pin --permission-mode
+#   codex     screen       3.02s         1.00s        trusts a new dir on first run
+#   copilot   screen       3.03s         1.00s        fast, no quirks found
+#   kilo      screen       3.25s         2.51s        2 retries on pane readiness
+#   grok      screen       3.03s         3.01s        slowest to accept a prompt
+#
+# Measured and NOT usable in a loop:
+#   kimi      prompt never lands — agent_prompt_stalled, and the agent really
+#             did not start (corroborated, not a timing artifact)
+#   gemini    accepts a prompt, then never finishes a turn — a loop cannot
+#             advance past a slot that never settles
 #
 # "structured" means the agent reports its own lifecycle state. "screen" means
 # herdr infers it from the rendered terminal — a heuristic, and one a strict
@@ -80,6 +89,31 @@ max_concurrent = 1
 # pressing enter there would be an agent granting itself trust over contents it
 # was explicitly warned about. Answer it yourself once, in that directory,
 # before putting codex in a loop.
+
+# ── Copilot ───────────────────────────────────────────────────────────────────
+[copilot]
+# Fast and unremarkable, which is the best thing a harness can be here.
+max_concurrent = 1
+
+# ── Kilo ──────────────────────────────────────────────────────────────────────
+[kilo]
+# Needed two retries before its pane was an available shell — handled by the
+# engine's agent_pane_busy retry, noted because it is the slowest starter of
+# the working set.
+max_concurrent = 1
+
+# ── Grok ──────────────────────────────────────────────────────────────────────
+[grok]
+# Slowest to accept a prompt (~3.5s from delivery to working) but reliable.
+max_concurrent = 1
+
+# ── Known NOT usable ──────────────────────────────────────────────────────────
+# kimi:   prompts never land. herdr reports agent_prompt_stalled and the agent
+#         genuinely does not start — corroborated by polling its status, so
+#         this is a real failure rather than herdr's 5s window being short.
+# gemini: accepts a prompt and starts, then never settles. A loop cannot
+#         advance past a slot that never finishes a turn.
+# Both re-probe in seconds if that changes upstream: `herdr-loop probe kimi`.
 
 # ── Everything else ───────────────────────────────────────────────────────────
 # gemini, cursor, amp, droid, kimi, grok, hermes, copilot, kilo, qodercli,

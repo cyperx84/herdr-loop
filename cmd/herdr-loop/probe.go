@@ -222,6 +222,16 @@ func runProbe(ctx context.Context, c *herdr.Client, kind, cwd string, args []str
 		if !herdr.IsAgentPromptStalled(err) {
 			break // a real error, not a readiness race
 		}
+		// herdr's stall window is 5s, which is shorter than some harnesses
+		// take to start. Before calling this a failure, ask whether the agent
+		// actually started — otherwise the matrix records "unusable in a loop"
+		// for a harness that merely starts slowly.
+		if probeAgentStarted(ctx, c, pane) {
+			res.FirstPromptOK = true
+			res.FirstPromptErr = ""
+			res.PromptToWorking = time.Since(t3)
+			break
+		}
 	}
 	if !res.FirstPromptOK {
 		return pane, nil
@@ -247,6 +257,25 @@ func runProbe(ctx context.Context, c *herdr.Client, kind, cwd string, args []str
 		}
 	}
 	return pane, nil
+}
+
+// probeAgentStarted reports whether an agent left idle shortly after a prompt
+// herdr declared stalled. Same corroboration the engine applies — a stall
+// report is evidence, not a verdict.
+func probeAgentStarted(ctx context.Context, c *herdr.Client, pane string) bool {
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		a, err := c.AgentGet(ctx, pane)
+		if err == nil && (a.Status == herdr.StatusWorking || a.Status == herdr.StatusBlocked) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		if !sleepCtx(ctx, 400*time.Millisecond) {
+			return false
+		}
+	}
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
