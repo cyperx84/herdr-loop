@@ -312,3 +312,42 @@ func TestTurnIsRecordedEvenWhenTheTransitionIsIgnored(t *testing.T) {
 		t.Error("turn not recorded because the transition was unactionable; the slot would stay ineligible forever")
 	}
 }
+
+// herdr declares a prompt stalled when it sees no lifecycle change within its
+// own 5s window. That window is shorter than some harnesses take to start, so
+// a cold pane reports stalled while the prompt in fact landed — reproduced on
+// consecutive runs against Claude Code. Failing the action there aborts work
+// that is already underway, and re-sending double-prompts the agent.
+func TestStalledPromptIsCorroboratedBeforeFailing(t *testing.T) {
+	client := &fakeHerdr{
+		promptErr: &herdr.APIError{Code: "agent_prompt_stalled", Message: "no observed state change within 5000 ms"},
+		// herdr said stalled, but the agent is in fact working.
+		agentGetStatus: herdr.StatusWorking,
+	}
+	model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
+	e := newEngine(t, baseConfig(t), client, model)
+
+	out := run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone, At: time.Now()})
+
+	if len(out.Escalations) != 0 {
+		t.Fatalf("escalated on a false stall: %v — the agent was working, the prompt landed", out.Escalations)
+	}
+}
+
+// A prompt that genuinely did not land must still fail. The corroboration is
+// there to catch herdr's short window, not to paper over a lost prompt.
+func TestStalledPromptStillFailsWhenTheAgentNeverStarts(t *testing.T) {
+	client := &fakeHerdr{
+		promptErr:      &herdr.APIError{Code: "agent_prompt_stalled", Message: "no observed state change within 5000 ms"},
+		agentGetStatus: herdr.StatusIdle, // never started
+	}
+	model := newModel().set("impl", herdr.StatusDone).set("review", herdr.StatusIdle)
+	cfg := baseConfig(t)
+	e := newEngine(t, cfg, client, model)
+
+	out := run(t, e, Transition{Slot: "impl", From: herdr.StatusWorking, To: herdr.StatusDone, At: time.Now()})
+
+	if len(out.Escalations) == 0 {
+		t.Fatal("a prompt that never landed was treated as delivered")
+	}
+}

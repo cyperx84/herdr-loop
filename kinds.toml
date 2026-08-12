@@ -26,19 +26,25 @@
 
 # ── Claude Code ───────────────────────────────────────────────────────────────
 [claude]
-# Plan mode turns "implement this" into "write a plan for this". The agent
-# reports working, finishes, reports done, and has changed nothing — a loop
-# then fails its gate forever on work that was never attempted, with nothing in
-# the lifecycle explaining why. Shift-Tab cycles the mode off.
+# Plan mode turns "implement this" into "write a plan for this": the agent
+# reports working, finishes, reports done, and has changed nothing — so a gate
+# fails forever on work that was never attempted, and nothing in the lifecycle
+# explains why.
 #
-# Sent as a raw escape sequence rather than a key name on purpose: herdr
-# rejects both S-Tab and BackTab as unsupported keys, while the sequence they
-# stand for goes through pane.send_text untouched.
-startup_keys      = ["\\e[Z"]
+# Do NOT fix this with keystrokes. Pin it at spawn, in the slot:
+#
+#     args = ["--model", "sonnet", "--permission-mode", "acceptEdits"]
+#
+# Two reasons, both learned by getting it wrong. A pane launched by herdr-loop
+# inherits the launching environment's plan mode, so toggling afterwards races
+# the agent's own startup and is unreliable. And the escape sequence this entry
+# used to send is not accepted by herdr 0.8.0: of "shift+tab", "S-Tab",
+# "BackTab" and the raw "\e[Z", only "shift+tab" is a valid key at all, and
+# even that only helps if it lands before the first prompt.
+#
+# Valid --permission-mode values: acceptEdits, auto, bypassPermissions,
+# manual, plan.
 startup_settle_ms = 500
-# One at a time. Concurrent Claude Code processes race a single rotating OAuth
-# credential with no lock — an upstream bug with many reporters and no fix, so
-# the mitigation here is simply not to create the race.
 max_concurrent    = 1
 
 # ── Pi ────────────────────────────────────────────────────────────────────────

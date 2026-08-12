@@ -474,7 +474,18 @@ func deliverInitialPrompt(ctx context.Context, eng *engine.Engine, target, slot,
 	// Through the engine, not the client directly: a just-spawned agent is
 	// not addressable for a moment after it first reports idle, and this is
 	// the prompt that always lands in that window.
+	// SendPrompt does not corroborate a stalled report the way the rule path
+	// does, so do it here too: the bootstrap prompt is the one most likely to
+	// hit it, because a slot's first prompt lands on the coldest possible pane.
 	if err := eng.SendPrompt(ctx, target, text); err != nil {
+		if eng.PromptLanded(ctx, target) {
+			// Not marking a turn: the agent is working, and leaving working
+			// is what records the turn. Marking it here would make the slot
+			// rule-eligible before it has done anything — the same mistake
+			// that once had a gate firing four times in three seconds.
+			log.Info("initial prompt reported stalled but the agent started working; treating as delivered", "slot", slot)
+			return
+		}
 		log.Error("initial prompt failed", "slot", slot, "err", err)
 		return
 	}

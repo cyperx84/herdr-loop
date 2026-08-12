@@ -32,15 +32,16 @@ type fakeHerdr struct {
 	starts   []herdr.AgentStartParams
 	notified []herdr.NotificationShowParams
 
-	gonePanes     []string
-	tabs          []herdr.TabCreateParams
-	sentText      []string
-	sendTextErr   error
-	processProbes []string
-	procGone      bool
-	procErr       error
-	splitPanes    map[string]bool
-	startedPanes  map[string]bool
+	agentGetStatus herdr.AgentStatus
+	gonePanes      []string
+	tabs           []herdr.TabCreateParams
+	sentText       []string
+	sendTextErr    error
+	processProbes  []string
+	procGone       bool
+	procErr        error
+	splitPanes     map[string]bool
+	startedPanes   map[string]bool
 
 	promptErr error
 	startErr  error
@@ -139,6 +140,9 @@ func (f *fakeHerdr) PaneSplit(_ context.Context, p herdr.PaneSplitParams) (herdr
 func (f *fakeHerdr) AgentGet(_ context.Context, target string) (herdr.Agent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.agentGetStatus != "" {
+		return herdr.Agent{PaneID: target, Status: f.agentGetStatus, InteractiveReady: true}, nil
+	}
 	if f.startedPanes[target] {
 		return herdr.Agent{PaneID: target, InteractiveReady: true}, nil
 	}

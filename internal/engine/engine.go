@@ -1178,15 +1178,55 @@ func (e *Engine) prompt(ctx context.Context, slot, text string) error {
 	// engine.
 	if err := e.sendPrompt(ctx, target, text); err != nil {
 		if herdr.IsAgentPromptStalled(err) {
-			// herdr could not observe a lifecycle change within 5s of
-			// delivery — it does not know the prompt was received. Surfacing
-			// that is the point; silently assuming it landed is the
-			// status-lies failure (§4.9).
-			return fmt.Errorf("engine: agent.prompt %s: herdr saw no lifecycle change, delivery unconfirmed: %w", slot, err)
+			// herdr saw no lifecycle change within its own 5s window. That is
+			// not proof the prompt was lost: the window is shorter than some
+			// harnesses take to start, so a cold pane reports stalled while
+			// the prompt in fact landed and the agent is about to work.
+			// Reproduced on consecutive runs against Claude Code.
+			//
+			// So corroborate rather than believe it — the same rule §4.9
+			// applies to herdr's status, applied here to herdr's error.
+			if e.promptLanded(ctx, target) {
+				e.log.Info("prompt reported stalled but the agent started working; treating as delivered",
+					"slot", slot, "target", target)
+				return nil
+			}
+			return fmt.Errorf("engine: agent.prompt %s: herdr saw no lifecycle change and the agent never started, delivery unconfirmed: %w", slot, err)
 		}
 		return fmt.Errorf("engine: agent.prompt %s: %w", slot, err)
 	}
 	return nil
+}
+
+// PromptLanded is promptLanded for the supervisor's bootstrap path, which
+// delivers a slot's first prompt outside the rule engine and hits the same
+// false-stall on the coldest possible pane.
+func (e *Engine) PromptLanded(ctx context.Context, target string) bool {
+	return e.promptLanded(ctx, target)
+}
+
+// promptLanded reports whether an agent started working shortly after a prompt
+// herdr declared stalled.
+//
+// Deliberately narrow: it asks only whether the agent left idle. Re-sending on
+// a false stall double-prompts the agent, which is worse than the stall it was
+// meant to fix, so this exists to avoid that rather than to retry anything.
+func (e *Engine) promptLanded(ctx context.Context, target string) bool {
+	deadline := time.Now().Add(PromptDeliveryTimeout)
+	for {
+		a, err := e.client.AgentGet(ctx, target)
+		if err == nil && (a.Status == herdr.StatusWorking || a.Status == herdr.StatusBlocked) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-time.After(400 * time.Millisecond):
+		case <-ctx.Done():
+			return false
+		}
+	}
 }
 
 // SendPrompt delivers a prompt to an agent target, retrying while herdr
