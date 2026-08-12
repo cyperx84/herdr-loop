@@ -33,15 +33,30 @@ type nameIndex struct {
 	// this loop's slot. The loop would then prompt an agent it does not own,
 	// which is the cross-contamination one-owner-per-slot exists to prevent.
 	own map[string]bool
+	// fromAgent maps herdr's registered agent name back to the slot name this
+	// loop uses everywhere else.
+	fromAgent map[string]string
 }
 
 // newNameIndex builds an index restricted to the given slot names.
-func newNameIndex(slots []engine.SlotConfig) *nameIndex {
+//
+// qualify maps a slot name to the name herdr actually registers its agent
+// under. herdr agent names are unique session-wide, so the engine qualifies
+// them with the loop's name to avoid colliding with unrelated work — which
+// means agent.list reports the qualified form and this index has to recognise
+// it while still answering in slot names. Pass nil for an identity mapping.
+func newNameIndex(slots []engine.SlotConfig, qualify func(string) string) *nameIndex {
 	own := make(map[string]bool, len(slots))
+	fromAgent := make(map[string]string, len(slots))
 	for _, s := range slots {
 		own[s.Name] = true
+		agentName := s.Name
+		if qualify != nil {
+			agentName = qualify(s.Name)
+		}
+		fromAgent[agentName] = s.Name
 	}
-	return &nameIndex{byName: make(map[string]string), own: own}
+	return &nameIndex{byName: make(map[string]string), own: own, fromAgent: fromAgent}
 }
 
 // slots lists every slot name the index knows, sorted so progress output is
@@ -71,10 +86,11 @@ func (n *nameIndex) update(agents []herdr.Agent) {
 		if a.Name == "" || a.PaneID == "" {
 			continue
 		}
-		if !n.own[a.Name] {
+		slot, ours := n.fromAgent[a.Name]
+		if !ours {
 			continue // another loop's agent, or a human's — not ours to drive
 		}
-		n.byName[a.Name] = a.PaneID
+		n.byName[slot] = a.PaneID
 	}
 }
 

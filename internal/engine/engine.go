@@ -1468,7 +1468,7 @@ func (e *Engine) startAgent(ctx context.Context, slot string, sc SlotConfig, pan
 	for attempt := 1; ; attempt++ {
 		_, err := e.client.AgentStart(ctx, herdr.AgentStartParams{
 			PaneID: paneID,
-			Name:   slot,
+			Name:   e.agentName(slot),
 			Kind:   sc.Kind,
 			Args:   sc.Args,
 		})
@@ -1584,6 +1584,61 @@ func (e *Engine) waitPaneGone(ctx context.Context, paneID string) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// AgentNameFor returns the slot-to-agent-name mapping a given loop uses, for
+// callers that must recognise herdr's qualified names without holding an
+// Engine — the supervisor builds its index before the engine exists.
+func AgentNameFor(loopName string) func(string) string {
+	return func(slot string) string {
+		name := sanitizeAgentName(loopName + "-" + slot)
+		if name == "" {
+			return sanitizeAgentName(slot)
+		}
+		return name
+	}
+}
+
+// agentName is the name herdr registers a slot's agent under.
+//
+// herdr agent names are unique across the WHOLE session, not per plugin or per
+// loop, so a slot called "impl" collides with any other agent anywhere in the
+// session already called "impl" — and "impl", "review" and "test" are exactly
+// the names people reach for. Observed immediately on a real machine: a loop
+// failed to spawn both its slots because unrelated work in another workspace
+// had already taken both names.
+//
+// Prefixing with the loop's name makes the collision as unlikely as the loop
+// names themselves are distinct, while leaving manifests readable — a slot
+// stays "impl" everywhere the user writes or reads it. Only herdr sees the
+// qualified form, and the engine's own slot-to-pane mapping is keyed on the
+// pane id rather than the name, so nothing downstream cares.
+//
+// Names must match [a-z][a-z0-9_-]{0,31}, so the result is sanitised and
+// truncated. A truncated prefix is still far better than none: the whole point
+// is to not be the bare word "impl".
+func (e *Engine) agentName(slot string) string { return AgentNameFor(e.cfg.Name)(slot) }
+
+// sanitizeAgentName coerces a string into herdr's agent-name grammar.
+func sanitizeAgentName(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-_")
+	// Must start with a letter.
+	for len(out) > 0 && (out[0] < 'a' || out[0] > 'z') {
+		out = out[1:]
+	}
+	if len(out) > 32 {
+		out = out[:32]
+	}
+	return strings.TrimRight(out, "-_")
 }
 
 // ShellReadyTimeout bounds the wait for a freshly split pane's shell to reach

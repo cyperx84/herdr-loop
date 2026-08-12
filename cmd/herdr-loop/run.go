@@ -168,7 +168,7 @@ func runLoopFile(ctx context.Context, opts loopOptions) (engine.Outcome, error) 
 		}
 	}()
 
-	idx := newNameIndex(res.Config.Slots)
+	idx := newNameIndex(res.Config.Slots, engine.AgentNameFor(res.Config.Name))
 	sm := state.New(teeingSnapshotter{client: client, idx: idx}, state.Options{ReconcileEvery: reconcileEvery})
 
 	bus, err := newEventBus(ctx, client)
@@ -313,6 +313,19 @@ func resolveWorktrees(ctx context.Context, client *herdr.Client, res *mapResult)
 		if req.Base != "" {
 			base := req.Base
 			params.Base = &base
+		}
+		// Anchor the worktree to THIS process's repo, not herdr's focused
+		// workspace.
+		//
+		// worktree.create takes an optional cwd and, without one, resolves
+		// against whichever workspace happens to be focused. A loop launched
+		// from one repo therefore created a worktree of a completely
+		// unrelated one — observed exactly that: a loop about herdr-loop
+		// produced a branch in changelogsdotinfo because that workspace had
+		// focus. Which repo a loop operates on must not depend on where the
+		// user's cursor happens to be.
+		if wd, err := os.Getwd(); err == nil {
+			params.CWD = &wd
 		}
 		created, err := client.WorktreeCreate(ctx, params)
 		if err != nil {

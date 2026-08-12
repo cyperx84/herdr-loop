@@ -48,7 +48,7 @@ func TestModelAdapterResolvesSlotByName(t *testing.T) {
 		{Name: "review", Agent: strPtr("codex"), PaneID: "w1:p2", Status: herdr.StatusWorking},
 	}
 
-	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}, {Name: "review"}, {Name: "a"}, {Name: "b"}})
+	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}, {Name: "review"}, {Name: "a"}, {Name: "b"}}, nil)
 	sm := state.New(teeingFake{fakeSnapshotter{agents}, idx}, state.Options{})
 
 	// Reconcile needs two passes to go live on a non-empty session (adopt,
@@ -94,7 +94,7 @@ func TestModelAdapterResolvesSlotByName(t *testing.T) {
 // an approval prompt's literal text, so this must always report "no match"
 // rather than ever synthesizing consent.
 func TestModelAdapterBlockedPromptAlwaysUnmatched(t *testing.T) {
-	a := modelAdapter{state: state.New(fakeSnapshotter{}, state.Options{}), idx: newNameIndex(nil)}
+	a := modelAdapter{state: state.New(fakeSnapshotter{}, state.Options{}), idx: newNameIndex(nil, nil)}
 	if _, ok := a.BlockedPrompt("anything"); ok {
 		t.Error("BlockedPrompt reported ok=true, want false always")
 	}
@@ -103,7 +103,7 @@ func TestModelAdapterBlockedPromptAlwaysUnmatched(t *testing.T) {
 // TestNameIndexReverseLookup covers slotFor, the direction feed() uses to
 // turn a pane-keyed state.Transition back into a slot-keyed engine.Transition.
 func TestNameIndexReverseLookup(t *testing.T) {
-	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}, {Name: "review"}, {Name: "a"}, {Name: "b"}})
+	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}, {Name: "review"}, {Name: "a"}, {Name: "b"}}, nil)
 	idx.update([]herdr.Agent{
 		{Name: "impl", PaneID: "w1:p1"},
 		{Name: "review", PaneID: "w1:p2"},
@@ -123,7 +123,7 @@ func TestNameIndexReverseLookup(t *testing.T) {
 // an agent that happened to share a slot's name would have been driven as if
 // it were ours. A session routinely contains agents from other work.
 func TestNameIndexIgnoresAgentsThisLoopDoesNotOwn(t *testing.T) {
-	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}, {Name: "review"}})
+	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}, {Name: "review"}}, nil)
 
 	idx.update([]herdr.Agent{
 		{Name: "impl", PaneID: "w1:p1"},     // ours
@@ -152,7 +152,7 @@ func TestNameIndexIgnoresAgentsThisLoopDoesNotOwn(t *testing.T) {
 // The specific collision the reviewer predicted: a leftover agent from a
 // crashed run, carrying the same name, in a different pane.
 func TestNameIndexDoesNotAdoptStaleAgentInAnotherPane(t *testing.T) {
-	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}})
+	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}}, nil)
 
 	// Our spawn lands first.
 	idx.update([]herdr.Agent{{Name: "impl", PaneID: "w1:p1"}})
@@ -166,5 +166,62 @@ func TestNameIndexDoesNotAdoptStaleAgentInAnotherPane(t *testing.T) {
 	idx.update([]herdr.Agent{{Name: "impl", PaneID: "w2:p2"}})
 	if pane, _ := idx.paneFor("impl"); pane != "w2:p2" {
 		t.Errorf("index did not follow the live agent: pane=%q", pane)
+	}
+}
+
+// herdr agent names are unique across the whole session, not per loop, so a
+// slot called "impl" collides with any other agent anywhere already using that
+// name — and "impl" and "review" are exactly what people reach for. Seen on a
+// real machine: a loop failed to spawn both slots because unrelated work in
+// another workspace had already taken both names.
+//
+// The engine qualifies the registered name with the loop's name, so the index
+// has to recognise the qualified form while still answering in slot names.
+func TestNameIndexRecognisesQualifiedAgentNames(t *testing.T) {
+	qualify := engine.AgentNameFor("wire-vars")
+	idx := newNameIndex([]engine.SlotConfig{{Name: "impl"}, {Name: "review"}}, qualify)
+
+	idx.update([]herdr.Agent{
+		{Name: qualify("impl"), PaneID: "w1:p1"}, // ours, qualified
+		{Name: "impl", PaneID: "w9:p9"},          // somebody else's bare "impl"
+	})
+
+	pane, ok := idx.paneFor("impl")
+	if !ok {
+		t.Fatal("the qualified agent was not recognised as this loop's slot")
+	}
+	if pane != "w1:p1" {
+		t.Errorf("paneFor(impl) = %q, want our own pane — a bare 'impl' from other work was adopted", pane)
+	}
+	if slot, ok := idx.slotFor("w9:p9"); ok {
+		t.Errorf("an unrelated agent named 'impl' resolved to slot %q; it would be prompted as ours", slot)
+	}
+}
+
+// The qualified name must satisfy herdr's grammar: [a-z][a-z0-9_-]{0,31}.
+func TestAgentNameIsValidForHerdr(t *testing.T) {
+	for _, c := range []struct{ loop, slot string }{
+		{"wire-manifest-vars", "impl"},
+		{"Loop With Spaces!", "review"},
+		{"", "impl"},
+		{"a-very-long-loop-name-that-goes-well-past-the-limit", "implementer"},
+	} {
+		got := engine.AgentNameFor(c.loop)(c.slot)
+		if got == "" {
+			t.Errorf("loop %q slot %q produced an empty name", c.loop, c.slot)
+			continue
+		}
+		if len(got) > 32 {
+			t.Errorf("name %q is %d chars, herdr allows 32", got, len(got))
+		}
+		if got[0] < 'a' || got[0] > 'z' {
+			t.Errorf("name %q must start with a letter", got)
+		}
+		for _, r := range got {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+				t.Errorf("name %q contains %q, outside herdr's grammar", got, r)
+				break
+			}
+		}
 	}
 }
