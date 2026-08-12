@@ -18,7 +18,7 @@
 #   opencode  structured   3.12s         33.54s       slow turns; keyless/free
 #   claude    screen       3.02s         2.51s        pin --permission-mode
 #   codex     screen       3.02s         1.00s        trusts a new dir on first run
-#   copilot   screen       3.03s         1.00s        fast, no quirks found
+#   copilot   screen       3.03s         1.00s        multi-line paste needs staged submit
 #   kilo      screen       3.25s         2.51s        2 retries on pane readiness
 #   grok      screen       3.03s         3.01s        slowest to accept a prompt
 #
@@ -92,8 +92,14 @@ max_concurrent = 1
 
 # ── Copilot ───────────────────────────────────────────────────────────────────
 [copilot]
-# Fast and unremarkable, which is the best thing a harness can be here.
 max_concurrent = 1
+# herdr 0.8.0 sends a bracketed-paste payload and then Enter after a fixed
+# 300ms. Copilot imports multi-line pastes asynchronously; long loop prompts
+# can still be importing when Enter arrives, so the key is discarded and the
+# agent stays idle. One-line probes bypass that paste path and hid the failure.
+# Stage the paste, let Copilot finish importing it, then submit through
+# agent.prompt so herdr's active-agent and lifecycle checks remain in force.
+multiline_paste_settle_ms = 1000
 
 # ── Kilo ──────────────────────────────────────────────────────────────────────
 [kilo]

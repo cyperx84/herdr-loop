@@ -490,7 +490,7 @@ func deliverInitialPrompt(ctx context.Context, eng *engine.Engine, target, slot,
 	// SendPrompt does not corroborate a stalled report the way the rule path
 	// does, so do it here too: the bootstrap prompt is the one most likely to
 	// hit it, because a slot's first prompt lands on the coldest possible pane.
-	if err := eng.SendPrompt(ctx, target, text); err != nil {
+	if err := eng.SendPrompt(ctx, slot, target, text); err != nil {
 		if eng.PromptLanded(ctx, target) {
 			// Not marking a turn: the agent is working, and leaving working
 			// is what records the turn. Marking it here would make the slot

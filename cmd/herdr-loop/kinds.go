@@ -19,10 +19,11 @@ import (
 //	max_concurrent     = 2
 //	mid_turn_injection = false
 type kindsFile map[string]struct {
-	MaxConcurrent    int      `toml:"max_concurrent"`
-	MidTurnInjection bool     `toml:"mid_turn_injection"`
-	StartupKeys      []string `toml:"startup_keys"`
-	StartupSettleMs  int      `toml:"startup_settle_ms"`
+	MaxConcurrent          int      `toml:"max_concurrent"`
+	MidTurnInjection       bool     `toml:"mid_turn_injection"`
+	StartupKeys            []string `toml:"startup_keys"`
+	StartupSettleMs        int      `toml:"startup_settle_ms"`
+	MultilinePasteSettleMs int      `toml:"multiline_paste_settle_ms"`
 }
 
 // loadKinds reads an optional kinds.toml. A missing file is not an error —
@@ -47,10 +48,11 @@ func loadKinds(path string) (map[string]engine.KindConfig, error) {
 	out := make(map[string]engine.KindConfig, len(kf))
 	for kind, v := range kf {
 		out[kind] = engine.KindConfig{
-			MaxConcurrent:    v.MaxConcurrent,
-			MidTurnInjection: v.MidTurnInjection,
-			StartupKeys:      v.StartupKeys,
-			StartupSettle:    time.Duration(v.StartupSettleMs) * time.Millisecond,
+			MaxConcurrent:        v.MaxConcurrent,
+			MidTurnInjection:     v.MidTurnInjection,
+			StartupKeys:          v.StartupKeys,
+			StartupSettle:        time.Duration(v.StartupSettleMs) * time.Millisecond,
+			MultilinePasteSettle: time.Duration(v.MultilinePasteSettleMs) * time.Millisecond,
 		}
 	}
 	return out, nil

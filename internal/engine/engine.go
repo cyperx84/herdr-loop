@@ -41,6 +41,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 	herdr "github.com/cyperx84/herdr-api"
@@ -226,6 +227,11 @@ type KindConfig struct {
 	// BackTab as unsupported keys, while the escape sequence they stand for
 	// goes through unchanged.
 	StartupKeys []string
+	// MultilinePasteSettle gives a harness time to ingest a bracketed-paste
+	// payload before herdr submits it. Zero uses herdr's normal atomic prompt
+	// path. This is only for measured harnesses whose paste processing exceeds
+	// herdr 0.8.0's fixed 300ms text-to-Enter delay.
+	MultilinePasteSettle time.Duration
 	// StartupSettle is how long to wait before this kind's first prompt.
 	//
 	// Applies with or without StartupKeys, because some harnesses report
@@ -1172,11 +1178,10 @@ func (e *Engine) prompt(ctx context.Context, slot, text string) error {
 	if !ok {
 		return fmt.Errorf("engine: prompt %s: slot has no agent target", slot)
 	}
-	// wait is nil on purpose. Blocking on agent.prompt --wait would make the
-	// fold synchronous with an agent's turn; the settle is observed as the
-	// next transition instead, which is the whole point of an event-driven
-	// engine.
-	if err := e.sendPrompt(ctx, target, text); err != nil {
+	// sendPrompt waits only for evidence that delivery started, never for the
+	// turn to settle. Completion remains the next model transition, which is
+	// what keeps the event-driven fold asynchronous.
+	if err := e.sendPrompt(ctx, target, text, e.slots[slot].Kind); err != nil {
 		if herdr.IsAgentPromptStalled(err) {
 			// herdr saw no lifecycle change within its own 5s window. That is
 			// not proof the prompt was lost: the window is shorter than some
@@ -1235,8 +1240,12 @@ func (e *Engine) promptLanded(ctx context.Context, target string) bool {
 // Exported for the supervisor's bootstrap path: a slot's first prompt is
 // delivered outside the rule engine, but it hits the same not-yet-registered
 // window and must handle it the same way.
-func (e *Engine) SendPrompt(ctx context.Context, target, text string) error {
-	return e.sendPrompt(ctx, target, text)
+func (e *Engine) SendPrompt(ctx context.Context, slot, target, text string) error {
+	cfg, ok := e.slots[slot]
+	if !ok {
+		return fmt.Errorf("engine: prompt %s: slot is not configured", slot)
+	}
+	return e.sendPrompt(ctx, target, text, cfg.Kind)
 }
 
 // waitInteractive blocks until herdr reports the agent in a pane is past its
@@ -1348,7 +1357,57 @@ func promptDeliveryTimeoutMs() *uint64 {
 // retried. Everything else, agent_prompt_stalled included, returns at once —
 // a stall means delivery is unconfirmed, which is a report to make, not a
 // condition to wait out.
-func (e *Engine) sendPrompt(ctx context.Context, target, text string) error {
+func (e *Engine) sendPrompt(ctx context.Context, target, text, kind string) error {
+	payload := text
+	staged := false
+	if settle := e.kindConfig(kind).MultilinePasteSettle; settle > 0 && strings.Contains(text, "\n") {
+		// herdr 0.8.0's agent.prompt writes the bracketed paste, then sends
+		// Enter after a fixed 300ms. Copilot processes a long multi-line paste
+		// asynchronously, so that Enter can arrive while its input widget is
+		// still importing the paste and is discarded. One-line probes never
+		// exercise that path.
+		//
+		// Stage all but the final rune as one complete bracketed paste, wait the
+		// measured per-harness interval, then send the final rune through
+		// agent.prompt. The latter still performs herdr's active-agent check,
+		// emits Enter, and supplies the lifecycle confirmation below. Splitting
+		// rather than appending a marker preserves the prompt byte-for-byte.
+		a, err := e.client.AgentGet(ctx, target)
+		if err != nil {
+			return fmt.Errorf("agent.get %s before staged prompt: %w", target, err)
+		}
+		if a.Agent == nil || *a.Agent != kind || a.LaunchPending || !a.InteractiveReady || !a.Status.Settled() {
+			return fmt.Errorf("agent %s is not a ready, settled %s before staged prompt", target, kind)
+		}
+		_, finalRuneBytes := utf8.DecodeLastRuneInString(text)
+		if finalRuneBytes == 0 {
+			return errors.New("multi-line prompt has no complete final rune")
+		}
+		cut := len(text) - finalRuneBytes
+		prefix, suffix := text[:cut], text[cut:]
+		if err := e.client.PaneSendText(ctx, target, "\x1b[200~"+prefix+"\x1b[201~"); err != nil {
+			return fmt.Errorf("stage multi-line prompt in %s: %w", target, err)
+		}
+		select {
+		case <-time.After(settle):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		// The settle widens the interval in which a startup approval or other
+		// blocker could appear. Re-check before agent.prompt supplies Enter;
+		// active-agent validation alone does not reject a blocked agent, and an
+		// unattended loop must never answer a dialog by accident.
+		a, err = e.client.AgentGet(ctx, target)
+		if err != nil {
+			return fmt.Errorf("agent.get %s before staged submit: %w", target, err)
+		}
+		if a.Agent == nil || *a.Agent != kind || a.LaunchPending || !a.InteractiveReady || !a.Status.Settled() {
+			return fmt.Errorf("agent %s is not a ready, settled %s before staged submit", target, kind)
+		}
+		payload = suffix
+		staged = true
+	}
+
 	deadline := time.Now().Add(AgentReadyTimeout)
 	for attempt := 1; ; attempt++ {
 		// A wait is requested, but only far enough to confirm delivery — not
@@ -1362,11 +1421,16 @@ func (e *Engine) sendPrompt(ctx context.Context, target, text string) error {
 		// began. That is the status-lie failure (§4.9) reaching the one
 		// operation the whole loop depends on.
 		//
-		// until=working with a short timeout asks herdr to confirm the agent
-		// actually started, then returns; the completion is still observed as
-		// the next transition, which is what keeps the fold asynchronous.
-		_, err := e.client.AgentPrompt(ctx, target, text, &herdr.AgentPromptWaitOptions{
-			Until:     []herdr.AgentStatus{herdr.StatusWorking},
+		// working/done/blocked with a short timeout asks herdr to confirm the
+		// agent actually started, then returns; done must be included because a
+		// cheap harness can finish between screen-classification samples (seen
+		// live on Copilot). Blocked is likewise proof the submitted prompt was
+		// acted on, not permission to answer the blocker. The completion is
+		// still observed as the next transition, keeping the fold asynchronous.
+		_, err := e.client.AgentPrompt(ctx, target, payload, &herdr.AgentPromptWaitOptions{
+			Until: []herdr.AgentStatus{
+				herdr.StatusWorking, herdr.StatusDone, herdr.StatusBlocked,
+			},
 			TimeoutMs: promptDeliveryTimeoutMs(),
 		})
 		if err == nil {
@@ -1377,6 +1441,13 @@ func (e *Engine) sendPrompt(ctx context.Context, target, text string) error {
 		}
 		var apiErr *herdr.APIError
 		if !errors.As(err, &apiErr) || apiErr.Code != "agent_not_ready" {
+			return err
+		}
+		// Once a prefix is staged, never retry the submission against a pane
+		// whose active-agent check failed. It may now host a shell or a
+		// replacement process; leaving unsubmitted text is safer than sending
+		// Enter to an identity we did not verify.
+		if staged {
 			return err
 		}
 		if time.Now().After(deadline) {

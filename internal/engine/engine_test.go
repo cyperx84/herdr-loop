@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -32,16 +33,18 @@ type fakeHerdr struct {
 	starts   []herdr.AgentStartParams
 	notified []herdr.NotificationShowParams
 
-	agentGetStatus herdr.AgentStatus
-	gonePanes      []string
-	tabs           []herdr.TabCreateParams
-	sentText       []string
-	sendTextErr    error
-	processProbes  []string
-	procGone       bool
-	procErr        error
-	splitPanes     map[string]bool
-	startedPanes   map[string]bool
+	agentGetStatus   herdr.AgentStatus
+	agentGetKind     string
+	agentGetSequence []herdr.Agent
+	gonePanes        []string
+	tabs             []herdr.TabCreateParams
+	sentText         []string
+	sendTextErr      error
+	processProbes    []string
+	procGone         bool
+	procErr          error
+	splitPanes       map[string]bool
+	startedPanes     map[string]bool
 
 	promptErr error
 	startErr  error
@@ -63,16 +66,26 @@ type removeWorktreeCall struct {
 	force       bool
 }
 
-type promptCall struct{ target, text string }
+type promptCall struct {
+	target string
+	text   string
+	wait   *herdr.AgentPromptWaitOptions
+}
 type keysCall struct {
 	target string
 	keys   []string
 }
 
-func (f *fakeHerdr) AgentPrompt(_ context.Context, target, text string, _ *herdr.AgentPromptWaitOptions) (herdr.Agent, error) {
+func (f *fakeHerdr) AgentPrompt(_ context.Context, target, text string, wait *herdr.AgentPromptWaitOptions) (herdr.Agent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.prompts = append(f.prompts, promptCall{target, text})
+	var copied *herdr.AgentPromptWaitOptions
+	if wait != nil {
+		v := *wait
+		v.Until = append([]herdr.AgentStatus(nil), wait.Until...)
+		copied = &v
+	}
+	f.prompts = append(f.prompts, promptCall{target: target, text: text, wait: copied})
 	return herdr.Agent{PaneID: target}, f.promptErr
 }
 
@@ -140,8 +153,17 @@ func (f *fakeHerdr) PaneSplit(_ context.Context, p herdr.PaneSplitParams) (herdr
 func (f *fakeHerdr) AgentGet(_ context.Context, target string) (herdr.Agent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.agentGetStatus != "" {
-		return herdr.Agent{PaneID: target, Status: f.agentGetStatus, InteractiveReady: true}, nil
+	if len(f.agentGetSequence) > 0 {
+		a := f.agentGetSequence[0]
+		f.agentGetSequence = f.agentGetSequence[1:]
+		return a, nil
+	}
+	if f.agentGetStatus != "" || f.agentGetKind != "" {
+		a := herdr.Agent{PaneID: target, Status: f.agentGetStatus, InteractiveReady: true}
+		if f.agentGetKind != "" {
+			a.Agent = &f.agentGetKind
+		}
+		return a, nil
 	}
 	if f.startedPanes[target] {
 		return herdr.Agent{PaneID: target, InteractiveReady: true}, nil
@@ -429,6 +451,109 @@ func newEngine(t *testing.T, cfg Config, client Herdr, model Model) *Engine {
 }
 
 // --- contracts -------------------------------------------------------------
+
+// herdr 0.8.0 submits agent.prompt with a fixed 300ms gap between a bracketed
+// paste and Enter. Copilot imports long multi-line pastes asynchronously, so
+// that Enter can be discarded even though the one-line probe path is healthy.
+// The Copilot capability stages only the multi-line prefix, then leaves the
+// final rune and all delivery confirmation to agent.prompt.
+func TestCopilotMultilinePromptStagesPasteBeforeConfirmedSubmit(t *testing.T) {
+	cfg := baseConfig(t)
+	cfg.Slots[1].Kind = "copilot"
+	cfg.Kinds = map[string]KindConfig{
+		"copilot": {MultilinePasteSettle: time.Millisecond},
+	}
+	client := &fakeHerdr{agentGetKind: "copilot", agentGetStatus: herdr.StatusIdle}
+	e := newEngine(t, cfg, client, newModel())
+
+	text := "First requirement.\nSecond requirement: café"
+	if err := e.SendPrompt(context.Background(), "review", "w1:p2", text); err != nil {
+		t.Fatalf("SendPrompt: %v", err)
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.sentText) != 1 {
+		t.Fatalf("pane.send_text calls = %d, want one staged paste", len(client.sentText))
+	}
+	wantStage := "\x1b[200~First requirement.\nSecond requirement: caf\x1b[201~"
+	if client.sentText[0] != wantStage {
+		t.Errorf("staged bytes = %q, want %q", client.sentText[0], wantStage)
+	}
+	if len(client.prompts) != 1 || client.prompts[0].text != "é" {
+		t.Fatalf("agent.prompt calls = %#v, want one final-rune submission", client.prompts)
+	}
+	wantUntil := []herdr.AgentStatus{herdr.StatusWorking, herdr.StatusDone, herdr.StatusBlocked}
+	if client.prompts[0].wait == nil || !slices.Equal(client.prompts[0].wait.Until, wantUntil) {
+		t.Fatalf("delivery corroboration statuses = %#v, want %#v", client.prompts[0].wait, wantUntil)
+	}
+}
+
+func TestCopilotOneLinePromptKeepsAtomicHerdrPath(t *testing.T) {
+	cfg := baseConfig(t)
+	cfg.Slots[1].Kind = "copilot"
+	cfg.Kinds = map[string]KindConfig{
+		"copilot": {MultilinePasteSettle: time.Millisecond},
+	}
+	client := &fakeHerdr{agentGetKind: "copilot", agentGetStatus: herdr.StatusIdle}
+	e := newEngine(t, cfg, client, newModel())
+
+	const text = "Reply with exactly: PROBE_OK"
+	if err := e.SendPrompt(context.Background(), "review", "w1:p2", text); err != nil {
+		t.Fatalf("SendPrompt: %v", err)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.sentText) != 0 {
+		t.Fatalf("one-line probe was staged with pane.send_text: %#v", client.sentText)
+	}
+	if len(client.prompts) != 1 || client.prompts[0].text != text {
+		t.Fatalf("agent.prompt calls = %#v, want original one-line prompt", client.prompts)
+	}
+}
+
+func TestStagedPromptDoesNotSubmitIfAgentBlocksDuringSettle(t *testing.T) {
+	cfg := baseConfig(t)
+	cfg.Slots[1].Kind = "copilot"
+	cfg.Kinds = map[string]KindConfig{
+		"copilot": {MultilinePasteSettle: time.Millisecond},
+	}
+	kind := "copilot"
+	client := &fakeHerdr{agentGetSequence: []herdr.Agent{
+		{Agent: &kind, Status: herdr.StatusIdle, InteractiveReady: true},
+		{Agent: &kind, Status: herdr.StatusBlocked, InteractiveReady: true},
+	}}
+	e := newEngine(t, cfg, client, newModel())
+
+	err := e.SendPrompt(context.Background(), "review", "w1:p2", "line one\nline two")
+	if err == nil || !strings.Contains(err.Error(), "before staged submit") {
+		t.Fatalf("SendPrompt error = %v, want blocker refusal", err)
+	}
+	if client.promptCount() != 0 {
+		t.Fatal("agent.prompt supplied Enter after a blocker appeared during paste settle")
+	}
+	if len(client.sentText) != 1 {
+		t.Fatalf("staged writes = %d, want the non-submitting paste only", len(client.sentText))
+	}
+}
+
+func TestStagedPromptRefusesUnverifiedAgentIdentity(t *testing.T) {
+	cfg := baseConfig(t)
+	cfg.Slots[1].Kind = "copilot"
+	cfg.Kinds = map[string]KindConfig{
+		"copilot": {MultilinePasteSettle: time.Millisecond},
+	}
+	client := &fakeHerdr{agentGetKind: "claude", agentGetStatus: herdr.StatusIdle}
+	e := newEngine(t, cfg, client, newModel())
+
+	err := e.SendPrompt(context.Background(), "review", "w1:p2", "line one\nline two")
+	if err == nil || !strings.Contains(err.Error(), "not a ready, settled copilot") {
+		t.Fatalf("SendPrompt error = %v, want wrong-agent refusal", err)
+	}
+	if len(client.sentText) != 0 || client.promptCount() != 0 {
+		t.Fatal("wrote prompt bytes before verifying that Copilot still owned the pane")
+	}
+}
 
 // A blocked slot is an approval or question UI herdr recognised. The default
 // policy escalates and halts that slot; it must never send keys, because

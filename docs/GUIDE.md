@@ -357,6 +357,10 @@ max_concurrent = 3
 
 [codex]
 max_concurrent = 1
+
+[copilot]
+max_concurrent = 1
+multiline_paste_settle_ms = 1000
 ```
 
 Fields, from `cmd/herdr-loop/kinds.go`'s `kindsFile` struct:
@@ -367,6 +371,7 @@ Fields, from `cmd/herdr-loop/kinds.go`'s `kindsFile` struct:
 | `mid_turn_injection` | whether prompting this kind while it's still `working` is known to land somewhere sensible. Off (`false`) for every kind today — no harness has been measured for this. |
 | `startup_keys` | a raw key sequence sent once via `pane.send_text` after the agent is confirmed interactive, before its first prompt. Claude Code's entry (`"\\e[Z"`, a raw Shift-Tab escape) exists because launching in plan mode silently reinterprets "implement this" as "write a plan for this" — the agent reports `working`, finishes, reports `done`, and has changed nothing, with nothing in the lifecycle explaining why. Sent as a raw escape sequence rather than a key name because herdr rejects both `S-Tab` and `BackTab` as unsupported keys, while the byte sequence they stand for passes through `pane.send_text` untouched. |
 | `startup_settle_ms` | how long to wait after `startup_keys` before the first prompt, for a kind whose TUI needs a moment after a key sequence lands. |
+| `multiline_paste_settle_ms` | stages a multi-line bracketed paste for this interval before submitting its final rune through `agent.prompt`. Copilot needs this because herdr 0.8.0's fixed 300ms paste-to-Enter delay can beat Copilot's asynchronous paste import. The final `agent.prompt` retains herdr's active-agent and lifecycle checks; one-line prompts stay on herdr's ordinary atomic path. |
 
 `checkKindCapacity` (run by both `validate` and `run`, before anything spawns) rejects a
 manifest outright if it declares more slots of a kind than that kind's `max_concurrent`
@@ -403,6 +408,7 @@ Measured so far, against herdr 0.8.0 (from `kinds.toml`'s own header):
 | `opencode` | structured | 3.12s | 33.54s | slow turns; no settle needed |
 | `claude` | screen | 3.02s | 2.51s | needs the plan-mode disarm above |
 | `codex` | screen | 3.02s | 1.00s | 1 retry on pane readiness; asks to trust a new directory on first run |
+| `copilot` | screen | 3.03s | 1.00s | multi-line paste uses a staged submit; one-line prompts use the normal path |
 
 "Structured" means the agent reports its own lifecycle state — `screen_detection_skipped:
 true` on every `agent.list` reconcile. "Screen" means herdr infers status by classifying the

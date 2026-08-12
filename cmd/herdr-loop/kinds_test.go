@@ -1,11 +1,28 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cyperx84/herdr-loop/internal/engine"
 )
+
+func TestLoadKindsMultilinePasteSettle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "kinds.toml")
+	if err := os.WriteFile(path, []byte("[copilot]\nmultiline_paste_settle_ms = 1000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kinds, err := loadKinds(path)
+	if err != nil {
+		t.Fatalf("loadKinds: %v", err)
+	}
+	if got := kinds["copilot"].MultilinePasteSettle; got != time.Second {
+		t.Fatalf("MultilinePasteSettle = %v, want 1s", got)
+	}
+}
 
 // Regression for the F2 review finding. Engine.Spawn holds a kind's
 // concurrency token for the agent's lifetime, so a manifest with more slots of

@@ -209,7 +209,11 @@ func runProbe(ctx context.Context, c *herdr.Client, kind, cwd string, args []str
 		}
 		t3 := time.Now()
 		_, err := c.AgentPrompt(ctx, pane, "Reply with exactly: PROBE_OK", &herdr.AgentPromptWaitOptions{
-			Until:     []herdr.AgentStatus{herdr.StatusWorking},
+			// Fast harnesses can complete between screen-classification samples;
+			// done and blocked still corroborate that delivery was acted on.
+			Until: []herdr.AgentStatus{
+				herdr.StatusWorking, herdr.StatusDone, herdr.StatusBlocked,
+			},
 			TimeoutMs: u64(15000),
 		})
 		if err == nil {
